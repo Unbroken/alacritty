@@ -517,5 +517,5 @@ fn use_srgb_color_space(window: &WinitWindow) {
         _ => return,
     };
 
-    view.window().unwrap().setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+    view.window().unwrap().setColorSpace(Some(&NSColorSpace::displayP3ColorSpace()));
 }
