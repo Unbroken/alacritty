@@ -444,7 +444,11 @@ impl Display {
             glyph_cache.reset_glyph_cache(&mut api);
         });
 
-        let padding = config.window.padding(window.scale_factor as f32);
+        let mut padding = config.window.padding(window.scale_factor as f32);
+        if window.is_fullscreen() {
+            padding = (0.0, 0.0);
+        }
+
         let viewport_size = window.inner_size();
 
         // Create new size with at least one column and row.
@@ -687,7 +691,10 @@ impl Display {
             height = dimensions.height as f32;
         }
 
-        let padding = config.window.padding(self.window.scale_factor as f32);
+        let mut padding = config.window.padding(self.window.scale_factor as f32);
+        if self.window.is_fullscreen() {
+            padding = (0.0, 0.0);
+        }
 
         let mut new_size = SizeInfo::new(
             width,

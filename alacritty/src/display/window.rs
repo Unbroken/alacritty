@@ -390,6 +390,17 @@ impl Window {
         self.set_fullscreen(self.window.fullscreen().is_none());
     }
 
+    pub fn is_fullscreen(&self) -> bool {
+        let monitor = self.window.current_monitor();
+
+        if let Some(monitor) = monitor {
+            return (self.window.inner_size() == monitor.size() || self.window.is_maximized())
+                && self.window.fullscreen().is_some();
+        }
+
+        false
+    }
+
     /// Toggle the window's maximized state.
     pub fn toggle_maximized(&self) {
         self.set_maximized(!self.window.is_maximized());
