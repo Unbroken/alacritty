@@ -14,6 +14,10 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 - Crashes on GPUs with partial robustness support
 
+### Changed
+
+- Don't highlight hints on hover when the mouse cursor is hidden
+
 ## 0.16.0
 
 ### Packaging
