@@ -6,7 +6,7 @@ if [ $# -lt 2 ]; then
     exit 1
 fi
 
-repo="alacritty/alacritty"
+repo="${GITHUB_REPOSITORY:-alacritty/alacritty}"
 file_path=$1
 bearer=$2
 
