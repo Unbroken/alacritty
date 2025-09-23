@@ -3,7 +3,7 @@
 # Usage helper.
 usage() {
     echo "Usage: upload_asset.sh <FILE> <TOKEN>"
-    echo "       upload_asset.sh --ensure-release <TOKEN>"
+    echo "       upload_asset.sh --ensure-release <TOKEN> [<BODY_JSON>]"
 }
 
 ensure_release_only=false
@@ -39,10 +39,15 @@ repo="${GITHUB_REPOSITORY:-alacritty/alacritty}"
 if [ "$ensure_release_only" = true ]; then
     file_path=""
     bearer=$1
+    release_body=${2-}
 else
     file_path=$1
     bearer=$2
+    release_body=""
 fi
+
+release_body=${release_body:-}
+file_path=${file_path:-}
 
 if [ "$ensure_release_only" = true ]; then
     echo "Ensuring release exists for $repo."
@@ -65,6 +70,7 @@ echo "Git tag: $tag"
 #
 # Since this might be a draft release, we can't just use the /releases/tags/:tag
 # endpoint which only shows published releases.
+
 echo "Checking for existing release..."
 upload_url=$(\
     curl \
@@ -84,13 +90,20 @@ if [ -z "$upload_url" ]; then
     echo "No release found."
     echo "Creating new release..."
 
+    if [ -n "$release_body" ]; then
+        release_payload="{\"tag_name\":\"$tag\",\"draft\":true,\"body\":$release_body}"
+    else
+        release_payload="{\"tag_name\":\"$tag\",\"draft\":true}"
+    fi
+
     # Create new release.
     response=$(
         curl -f \
             --http1.1 \
             -X POST \
             -H "Authorization: Bearer $bearer" \
-            -d "{\"tag_name\":\"$tag\",\"draft\":true}" \
+            -H "Content-Type: application/json" \
+            -d "$release_payload" \
             "https://api.github.com/repos/$repo/releases" \
             2> /dev/null\
     )
