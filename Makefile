@@ -22,12 +22,17 @@ APP_COMPLETIONS_DIR = $(APP_EXTRAS_DIR)/completions
 APP_ICON_ASSET = $(ASSETS_DIR)/logo/alacritty.icon
 APP_ICON_NAME = alacritty
 APP_ASSETCATALOG_DIR = $(APP_DIR)/assetcatalog
+APP_NOTARIZE_ARCHIVE = $(APP_DIR)/$(APP_NAME).zip
 BUILD_CONFIG = .build-config
 
 -include $(BUILD_CONFIG)
 
 APP_CODESIGN_IDENTITY ?= $(ALACRITTY_CODESIGN_IDENTITY)
 APP_CODESIGN_IDENTITY ?= -
+APP_CODESIGN_FLAGS ?= $(ALACRITTY_CODESIGN_FLAGS)
+APP_CODESIGN_FLAGS ?=
+APP_NOTARIZE_PROFILE ?= $(ALACRITTY_NOTARIZE_PROFILE)
+APP_NOTARIZE_PROFILE ?=
 
 DMG_NAME = Alacritty.dmg
 DMG_DIR = $(RELEASE_DIR)/osx
@@ -78,7 +83,14 @@ $(APP_NAME)-%: $(TARGET)-%
 	@rm -rf $(APP_ASSETCATALOG_DIR)
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@codesign --remove-signature "$(APP_DIR)/$(APP_NAME)"
-	@codesign --force --deep --sign "$(APP_CODESIGN_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
+	@codesign --force --deep $(APP_CODESIGN_FLAGS) --sign "$(APP_CODESIGN_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
+	@set -e; if [ -n "$(APP_NOTARIZE_PROFILE)" ]; then \
+		ditto -c -k --sequesterRsrc --keepParent "$(APP_DIR)/$(APP_NAME)" "$(APP_NOTARIZE_ARCHIVE)"; \
+		xcrun notarytool submit "$(APP_NOTARIZE_ARCHIVE)" --keychain-profile "$(APP_NOTARIZE_PROFILE)" --wait; \
+		xcrun stapler staple "$(APP_DIR)/$(APP_NAME)"; \
+		xcrun stapler validate "$(APP_DIR)/$(APP_NAME)"; \
+		rm -f "$(APP_NOTARIZE_ARCHIVE)"; \
+	fi
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 
 dmg: $(DMG_NAME)-native ## Create an Alacritty.dmg
