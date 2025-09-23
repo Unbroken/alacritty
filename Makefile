@@ -19,6 +19,9 @@ APP_BINARY = $(RELEASE_DIR)/$(TARGET)
 APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
 APP_EXTRAS_DIR = $(APP_DIR)/$(APP_NAME)/Contents/Resources
 APP_COMPLETIONS_DIR = $(APP_EXTRAS_DIR)/completions
+APP_ICON_ASSET = $(ASSETS_DIR)/logo/alacritty.icon
+APP_ICON_NAME = alacritty
+APP_ASSETCATALOG_DIR = $(APP_DIR)/assetcatalog
 
 DMG_NAME = Alacritty.dmg
 DMG_DIR = $(RELEASE_DIR)/osx
@@ -55,6 +58,18 @@ $(APP_NAME)-%: $(TARGET)-%
 	@cp -fRp $(APP_TEMPLATE) $(APP_DIR)
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
 	@cp -fp $(COMPLETIONS) $(APP_COMPLETIONS_DIR)
+	@rm -rf $(APP_ASSETCATALOG_DIR)
+	@mkdir -p $(APP_ASSETCATALOG_DIR)
+	@xcrun actool "$(APP_ICON_ASSET)" \
+		--app-icon "$(APP_ICON_NAME)" \
+		--compile "$(APP_ASSETCATALOG_DIR)" \
+		--output-partial-info-plist "$(APP_ASSETCATALOG_DIR)/asset-info.plist" \
+		--platform macosx --target-device mac \
+		--minimum-deployment-target 10.11
+	@cp -fp "$(APP_ASSETCATALOG_DIR)/Assets.car" "$(APP_EXTRAS_DIR)/Assets.car"
+	@cp -fp "$(APP_ASSETCATALOG_DIR)/alacritty.icns" "$(APP_EXTRAS_DIR)/alacritty.icns"
+	@/usr/libexec/PlistBuddy -c "Merge $(APP_ASSETCATALOG_DIR)/asset-info.plist" "$(APP_DIR)/$(APP_NAME)/Contents/Info.plist" >/dev/null 2>&1 || true
+	@rm -rf $(APP_ASSETCATALOG_DIR)
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@codesign --remove-signature "$(APP_DIR)/$(APP_NAME)"
 	@codesign --force --deep --sign - "$(APP_DIR)/$(APP_NAME)"

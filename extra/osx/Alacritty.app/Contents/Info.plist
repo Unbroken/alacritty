@@ -23,7 +23,9 @@
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>CFBundleIconFile</key>
-  <string>alacritty.icns</string>
+  <string>alacritty</string>
+  <key>CFBundleIconName</key>
+  <string>alacritty</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSMainNibFile</key>
