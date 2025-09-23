@@ -1,12 +1,14 @@
+> **Note:** This repository is a macOS-focused fork. For a summary of the user-facing differences, see [FORK_NOTES.md](./FORK_NOTES.md).
+
 <p align="center">
-    <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
+    <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/Unbroken/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
 </p>
 
 <h1 align="center">Alacritty - A fast, cross-platform, OpenGL terminal emulator</h1>
 
 <p align="center">
   <img alt="Alacritty - A fast, cross-platform, OpenGL terminal emulator"
-       src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/promo/alacritty-readme.png">
+       src="https://raw.githubusercontent.com/Unbroken/alacritty/master/extra/promo/alacritty-readme.png">
 </p>
 
 ## About
@@ -21,7 +23,7 @@ The software is considered to be at a **beta** level of readiness; there are
 a few missing features and bugs to be fixed, but it is already used by many as
 a daily driver.
 
-Precompiled binaries are available from the [GitHub releases page](https://github.com/alacritty/alacritty/releases).
+Precompiled binaries are available from the [GitHub releases page](https://github.com/Unbroken/alacritty/releases).
 
 Join [`#alacritty`] on libera.chat if you have questions or looking for a quick help.
 
@@ -43,7 +45,7 @@ Alacritty can be installed by using various package managers on Linux, BSD,
 macOS and Windows.
 
 Prebuilt binaries for macOS and Windows can also be downloaded from the
-[GitHub releases page](https://github.com/alacritty/alacritty/releases).
+[GitHub releases page](https://github.com/Unbroken/alacritty/releases).
 
 For everyone else, the detailed instructions to install Alacritty can be found
 [here](INSTALL.md).
@@ -111,4 +113,4 @@ niceties like a GUI config editor.
 
 Alacritty is released under the [Apache License, Version 2.0].
 
-[Apache License, Version 2.0]: https://github.com/alacritty/alacritty/blob/master/LICENSE-APACHE
+[Apache License, Version 2.0]: https://github.com/Unbroken/alacritty/blob/master/LICENSE-APACHE

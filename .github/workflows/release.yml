@@ -17,7 +17,17 @@ jobs:
         with:
           fetch-depth: 0
       - name: Ensure draft release exists
-        run: ./.github/workflows/upload_asset.sh --ensure-release "$GITHUB_TOKEN"
+        env:
+          RELEASE_BODY: ${{ github.workspace }}/FORK_NOTES.md
+        run: |
+          BODY_PATH=${RELEASE_BODY}
+          if [ ! -f "$BODY_PATH" ]; then
+            echo "FORK_NOTES.md missing; falling back to empty release body"
+            BODY_CONTENT=""
+          else
+            BODY_CONTENT=$(jq -Rs . < "$BODY_PATH")
+          fi
+          ./.github/workflows/upload_asset.sh --ensure-release "$GITHUB_TOKEN" "$BODY_CONTENT"
 
   macos:
     needs: prepare_release
