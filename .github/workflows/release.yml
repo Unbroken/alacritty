@@ -9,7 +9,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare_release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Ensure draft release exists
+        run: ./.github/workflows/upload_asset.sh --ensure-release "$GITHUB_TOKEN"
+
   macos:
+    needs: prepare_release
     runs-on: macos-26
     environment: macOS Sign
     env:
@@ -95,6 +106,7 @@ jobs:
           ./.github/workflows/upload_asset.sh ./Alacritty-${GITHUB_REF##*/}.dmg $GITHUB_TOKEN
 
   windows:
+    needs: prepare_release
     runs-on: windows-latest
 
     defaults:
@@ -125,6 +137,7 @@ jobs:
             ./Alacritty-${GITHUB_REF##*/}-installer.msi $GITHUB_TOKEN
 
   linux:
+    needs: prepare_release
     runs-on: ubuntu-latest
 
     steps:

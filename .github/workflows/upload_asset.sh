@@ -1,16 +1,54 @@
 #!/bin/bash
 
-# Assure parameters are correct.
-if [ $# -lt 2 ]; then
+# Usage helper.
+usage() {
     echo "Usage: upload_asset.sh <FILE> <TOKEN>"
+    echo "       upload_asset.sh --ensure-release <TOKEN>"
+}
+
+ensure_release_only=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ensure-release)
+            ensure_release_only=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ "$ensure_release_only" = true ] && [ $# -lt 1 ]; then
+    usage
+    exit 1
+fi
+
+if [ "$ensure_release_only" = false ] && [ $# -lt 2 ]; then
+    usage
     exit 1
 fi
 
 repo="${GITHUB_REPOSITORY:-alacritty/alacritty}"
-file_path=$1
-bearer=$2
 
-echo "Starting asset upload from $file_path to $repo."
+if [ "$ensure_release_only" = true ]; then
+    file_path=""
+    bearer=$1
+else
+    file_path=$1
+    bearer=$2
+fi
+
+if [ "$ensure_release_only" = true ]; then
+    echo "Ensuring release exists for $repo."
+else
+    echo "Starting asset upload from $file_path to $repo."
+fi
 
 # Get the release for this tag.
 tag="$(git describe --tags --abbrev=0)"
@@ -75,6 +113,11 @@ fi
 if [ -z "$upload_url" ]; then
     printf "\e[31mError: Unable to find release upload url.\e[0m\n"
     exit 2
+fi
+
+if [ "$ensure_release_only" = true ]; then
+    echo "Release is available."
+    exit 0
 fi
 
 # Upload the file to the tag's release.
