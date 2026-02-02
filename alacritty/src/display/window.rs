@@ -237,10 +237,12 @@ impl Window {
         self.window.set_visible(visibility);
     }
 
-    #[cfg(target_os = "macos")]
     #[inline]
     pub fn focus_window(&self) {
+        // focus_window() is a no-op on Wayland, so also request user attention
+        // which uses xdg-activation and may grant focus depending on compositor.
         self.window.focus_window();
+        self.window.request_user_attention(Some(UserAttentionType::Informational));
     }
 
     /// Set the window title.
@@ -368,6 +370,18 @@ impl Window {
         self.window.id()
     }
 
+    /// Get the inner (client area) position of the window on screen.
+    /// This matches the coordinate origin used by CursorMoved events.
+    /// Returns `None` on Wayland where window positions are not available.
+    pub fn inner_position(&self) -> Option<winit::dpi::PhysicalPosition<i32>> {
+        self.window.inner_position().ok()
+    }
+
+    /// Set the outer position of the window on screen.
+    pub fn set_outer_position<P: Into<winit::dpi::Position>>(&self, position: P) {
+        self.window.set_outer_position(position);
+    }
+
     pub fn set_transparent(&self, transparent: bool) {
         self.window.set_transparent(transparent);
     }
@@ -463,8 +477,9 @@ impl Window {
         // the text.
         let offset = if self.is_x11 { 1 } else { 0 };
         let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
+        // Use top_offset to account for both padding and tab bar height.
         let nspot_y =
-            f64::from(size.padding_y() + (point.line + offset) as f32 * size.cell_height());
+            f64::from(size.top_offset() + (point.line + offset) as f32 * size.cell_height());
 
         // NOTE: some compositors don't like excluding too much and try to render popup at the
         // bottom right corner of the provided area, so exclude just the full-width char to not
