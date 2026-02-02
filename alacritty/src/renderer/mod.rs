@@ -334,7 +334,8 @@ impl Renderer {
                 size.padding_x() as i32,
                 size.padding_y() as i32,
                 size.width() as i32 - 2 * size.padding_x() as i32,
-                size.height() as i32 - 2 * size.padding_y() as i32,
+                // Account for tab bar height at the top when calculating viewport height.
+                size.height() as i32 - 2 * size.padding_y() as i32 - size.tab_bar_height() as i32,
             );
         }
     }

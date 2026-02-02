@@ -79,6 +79,102 @@ const SHORTENER: char = '…';
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
 
+/// Default accent color (orange) used when system accent color is unavailable.
+const DEFAULT_ACCENT_COLOR: Rgb = Rgb::new(0xe9, 0x54, 0x20);
+
+/// Cached system accent color (queried once at first use).
+static CACHED_ACCENT_COLOR: std::sync::OnceLock<Rgb> = std::sync::OnceLock::new();
+
+/// Get the cached system accent color.
+fn cached_accent_color() -> Rgb {
+    *CACHED_ACCENT_COLOR.get_or_init(get_system_accent_color)
+}
+
+/// Convert accent color name to RGB.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn accent_color_name_to_rgb(name: &str) -> Rgb {
+    match name {
+        // Ubuntu Yaru accent colors (from yaru-theme source)
+        "default" | "orange" => Rgb::new(0xe9, 0x54, 0x20),
+        "bark" => Rgb::new(0x78, 0x78, 0x59),
+        "sage" => Rgb::new(0x65, 0x7b, 0x69),
+        "olive" => Rgb::new(0x4b, 0x85, 0x01),
+        "viridian" => Rgb::new(0x03, 0x87, 0x5b),
+        "prussiangreen" => Rgb::new(0x30, 0x82, 0x80),
+        "blue" => Rgb::new(0x00, 0x73, 0xe5),
+        "purple" => Rgb::new(0x88, 0x56, 0xeb),
+        "magenta" => Rgb::new(0xbc, 0x33, 0xdb),
+        "red" => Rgb::new(0xe6, 0x1d, 0x34),
+        // GNOME accent colors (may differ slightly)
+        "teal" => Rgb::new(0x2a, 0xa1, 0xb3),
+        "green" => Rgb::new(0x3a, 0x94, 0x4a),
+        "yellow" => Rgb::new(0xc6, 0x92, 0x00),
+        "pink" => Rgb::new(0xd5, 0x69, 0x99),
+        "slate" => Rgb::new(0x6f, 0x8c, 0x96),
+        _ => {
+            info!("Unknown accent color '{}', using default", name);
+            DEFAULT_ACCENT_COLOR
+        },
+    }
+}
+
+/// Get the system accent color using gio/GSettings.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn get_system_accent_color() -> Rgb {
+    use gio::prelude::*;
+
+    let settings = gio::Settings::new("org.gnome.desktop.interface");
+
+    // Check if accent-color key exists by checking the schema (GNOME 47+)
+    if let Some(schema) = settings.settings_schema()
+        && schema.has_key("accent-color")
+    {
+        let color_name = settings.string("accent-color");
+        info!("System accent color: '{}'", color_name);
+        return accent_color_name_to_rgb(&color_name);
+    }
+
+    // Fallback: parse from gtk-theme (Ubuntu Yaru variants)
+    let theme = settings.string("gtk-theme").to_string();
+    if let Some(color) = theme.strip_prefix("Yaru-") {
+        // Handle variants like "Yaru-blue-dark" -> "blue"
+        let color = color.split('-').next().unwrap_or("orange");
+        info!("System accent color from gtk-theme: '{}'", color);
+        return accent_color_name_to_rgb(color);
+    }
+
+    // Plain "Yaru" uses Ubuntu orange
+    if theme == "Yaru" || theme.starts_with("Yaru-dark") {
+        return DEFAULT_ACCENT_COLOR;
+    }
+
+    DEFAULT_ACCENT_COLOR
+}
+
+/// Get the system accent color on macOS via NSColor.controlAccentColor.
+#[cfg(target_os = "macos")]
+fn get_system_accent_color() -> Rgb {
+    use objc2_app_kit::{NSColor, NSColorSpace};
+
+    let accent = NSColor::controlAccentColor();
+    if let Some(srgb) = accent.colorUsingColorSpace(&NSColorSpace::sRGBColorSpace()) {
+        let r = (srgb.redComponent() * 255.0) as u8;
+        let g = (srgb.greenComponent() * 255.0) as u8;
+        let b = (srgb.blueComponent() * 255.0) as u8;
+        info!("System accent color: rgb({r}, {g}, {b})");
+        return Rgb::new(r, g, b);
+    }
+
+    DEFAULT_ACCENT_COLOR
+}
+
+/// Get the system accent color on Windows (fallback to default).
+#[cfg(windows)]
+fn get_system_accent_color() -> Rgb {
+    // TODO: Use Windows accent color API
+    DEFAULT_ACCENT_COLOR
+}
+
 #[derive(Debug)]
 pub enum Error {
     /// Error with window management.
@@ -161,6 +257,9 @@ pub struct SizeInfo<T = f32> {
     /// Vertical window padding.
     padding_y: T,
 
+    /// Height reserved for tab bar at top of window.
+    tab_bar_height: T,
+
     /// Number of lines in the viewport.
     screen_lines: usize,
 
@@ -177,6 +276,7 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
             cell_height: size_info.cell_height as u32,
             padding_x: size_info.padding_x as u32,
             padding_y: size_info.padding_y as u32,
+            tab_bar_height: size_info.tab_bar_height as u32,
             screen_lines: size_info.screen_lines,
             columns: size_info.columns,
         }
@@ -224,6 +324,11 @@ impl<T: Clone + Copy> SizeInfo<T> {
     pub fn padding_y(&self) -> T {
         self.padding_y
     }
+
+    #[inline]
+    pub fn tab_bar_height(&self) -> T {
+        self.tab_bar_height
+    }
 }
 
 impl SizeInfo<f32> {
@@ -233,16 +338,40 @@ impl SizeInfo<f32> {
         height: f32,
         cell_width: f32,
         cell_height: f32,
+        padding_x: f32,
+        padding_y: f32,
+        dynamic_padding: bool,
+    ) -> SizeInfo {
+        Self::new_with_tab_bar(
+            width,
+            height,
+            cell_width,
+            cell_height,
+            padding_x,
+            padding_y,
+            dynamic_padding,
+            0.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tab_bar(
+        width: f32,
+        height: f32,
+        cell_width: f32,
+        cell_height: f32,
         mut padding_x: f32,
         mut padding_y: f32,
         dynamic_padding: bool,
+        tab_bar_height: f32,
     ) -> SizeInfo {
         if dynamic_padding {
             padding_x = Self::dynamic_padding(padding_x.floor(), width, cell_width);
             padding_y = Self::dynamic_padding(padding_y.floor(), height, cell_height);
         }
 
-        let lines = (height - 2. * padding_y) / cell_height;
+        // Account for tab bar when calculating available space for terminal lines.
+        let lines = (height - 2. * padding_y - tab_bar_height) / cell_height;
         let screen_lines = cmp::max(lines as usize, MIN_SCREEN_LINES);
 
         let columns = (width - 2. * padding_x) / cell_width;
@@ -255,9 +384,16 @@ impl SizeInfo<f32> {
             cell_height,
             padding_x: padding_x.floor(),
             padding_y: padding_y.floor(),
+            tab_bar_height,
             screen_lines,
             columns,
         }
+    }
+
+    /// Get the total top offset (padding_y + tab_bar_height).
+    #[inline]
+    pub fn top_offset(&self) -> f32 {
+        self.padding_y + self.tab_bar_height
     }
 
     #[inline]
@@ -267,13 +403,43 @@ impl SizeInfo<f32> {
 
     /// Check if coordinates are inside the terminal grid.
     ///
-    /// The padding, message bar or search are not counted as part of the grid.
+    /// The padding, message bar, search, or tab bar are not counted as part of the grid.
     #[inline]
     pub fn contains_point(&self, x: usize, y: usize) -> bool {
+        let top = self.top_offset();
         x <= (self.padding_x + self.columns as f32 * self.cell_width) as usize
             && x > self.padding_x as usize
-            && y <= (self.padding_y + self.screen_lines as f32 * self.cell_height) as usize
-            && y > self.padding_y as usize
+            && y <= (top + self.screen_lines as f32 * self.cell_height) as usize
+            && y > top as usize
+    }
+
+    /// Check if the y coordinate is within the tab bar area.
+    #[inline]
+    pub fn is_in_tab_bar(&self, y: usize) -> bool {
+        self.tab_bar_height > 0.0 && (y as f32) < self.tab_bar_height
+    }
+
+    /// Get the tab index at the given x coordinate, if in the tab bar.
+    ///
+    /// Returns None if there are no tabs or the click is outside valid tab areas.
+    #[inline]
+    pub fn tab_at_point(&self, x: usize, tab_count: usize) -> Option<usize> {
+        if tab_count == 0 || self.tab_bar_height <= 0.0 {
+            return None;
+        }
+
+        // Use cell-grid-aligned tab width to match the rendered tab boundaries.
+        let tab_width_px = self.width / tab_count as f32;
+        let grid_tab_width = (tab_width_px / self.cell_width).floor() * self.cell_width;
+        let tab_index = (x as f32 / grid_tab_width) as usize;
+
+        if tab_index < tab_count {
+            Some(tab_index)
+        } else {
+            // Click is in the remainder area past the last grid-aligned tab;
+            // attribute it to the last tab.
+            Some(tab_count - 1)
+        }
     }
 
     /// Calculate padding to spread it evenly around the terminal content.
@@ -397,6 +563,9 @@ pub struct Display {
 
     glyph_cache: GlyphCache,
     meter: Meter,
+
+    /// Whether the tab bar is currently visible (affects SizeInfo).
+    tab_bar_visible: bool,
 }
 
 impl Display {
@@ -451,8 +620,12 @@ impl Display {
 
         let viewport_size = window.inner_size();
 
+        // Tab bar is initially hidden (shown only when there are 2+ tabs).
+        // Tab bar height starts at 0 and is updated when multiple tabs exist.
+        let tab_bar_height = 0.0;
+
         // Create new size with at least one column and row.
-        let size_info = SizeInfo::new(
+        let size_info = SizeInfo::new_with_tab_bar(
             viewport_size.width as f32,
             viewport_size.height as f32,
             cell_width,
@@ -460,10 +633,12 @@ impl Display {
             padding.0,
             padding.1,
             config.window.dynamic_padding && config.window.dimensions().is_none(),
+            tab_bar_height,
         );
 
         info!("Cell size: {cell_width} x {cell_height}");
         info!("Padding: {} x {}", size_info.padding_x(), size_info.padding_y());
+        info!("Tab bar height: {}", size_info.tab_bar_height());
         info!("Width: {}, Height: {}", size_info.width(), size_info.height());
 
         // Update OpenGL projection.
@@ -543,12 +718,46 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
+            tab_bar_visible: false,
         })
     }
 
     #[inline]
     pub fn gl_context(&self) -> &PossiblyCurrentContext {
         &self.context
+    }
+
+    /// Set whether the tab bar should be visible and trigger resize if changed.
+    pub fn set_tab_bar_visible(&mut self, visible: bool) {
+        if self.tab_bar_visible != visible {
+            self.tab_bar_visible = visible;
+            // Trigger a resize to update SizeInfo with correct tab bar height.
+            self.pending_update.set_dimensions(self.window.inner_size());
+        }
+    }
+
+    /// Compute a `SizeInfo` derived from the current one but with a tab bar.
+    pub fn size_info_with_tab_bar(&self) -> SizeInfo {
+        let current = &self.size_info;
+        SizeInfo::new_with_tab_bar(
+            current.width(),
+            current.height(),
+            current.cell_width(),
+            current.cell_height(),
+            current.padding_x(),
+            current.padding_y(),
+            false,
+            current.cell_height() + 8.0,
+        )
+    }
+
+    /// Enable the tab bar immediately, updating both visibility and `size_info`.
+    /// Unlike `set_tab_bar_visible`, this does not queue a pending resize.
+    pub fn enable_tab_bar(&mut self) {
+        if !self.tab_bar_visible {
+            self.tab_bar_visible = true;
+            self.size_info = self.size_info_with_tab_bar();
+        }
     }
 
     pub fn make_not_current(&mut self) {
@@ -696,7 +905,11 @@ impl Display {
             padding = (0.0, 0.0);
         }
 
-        let mut new_size = SizeInfo::new(
+        // Tab bar height is only non-zero when tab bar is visible (2+ tabs).
+        // Add padding around the text (4px above + 4px below = 8px total).
+        let tab_bar_height = if self.tab_bar_visible { cell_height + 8.0 } else { 0.0 };
+
+        let mut new_size = SizeInfo::new_with_tab_bar(
             width,
             height,
             cell_width,
@@ -704,6 +917,7 @@ impl Display {
             padding.0,
             padding.1,
             config.window.dynamic_padding,
+            tab_bar_height,
         );
 
         // Update number of column/lines in the viewport.
@@ -786,6 +1000,7 @@ impl Display {
         message_buffer: &MessageBuffer,
         config: &UiConfig,
         search_state: &mut SearchState,
+        tab_info: Option<(Vec<String>, usize)>,
     ) {
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
@@ -886,6 +1101,11 @@ impl Display {
         }
 
         let mut rects = lines.rects(&metrics, &size_info);
+
+        // Draw tab bar if tabs are enabled.
+        if let Some((tab_titles, active_index)) = tab_info {
+            self.draw_tab_bar(config, &tab_titles, active_index, &mut rects);
+        }
 
         if let Some(vi_cursor_point) = vi_cursor_point {
             // Indicate vi mode by showing the cursor's position in the top right corner.
@@ -1330,6 +1550,129 @@ impl Display {
             &self.size_info,
             &mut self.glyph_cache,
         );
+    }
+
+    /// Draw the tab bar at the top of the window.
+    ///
+    /// This draws a horizontal bar with tab titles, highlighting the active tab.
+    /// Note: This method draws its own rects immediately (doesn't add to main rects vector)
+    /// to ensure text is drawn on top of the background.
+    fn draw_tab_bar(
+        &mut self,
+        config: &UiConfig,
+        tab_titles: &[String],
+        active_index: usize,
+        _rects: &mut [RenderRect],
+    ) {
+        let size_info = self.size_info;
+        let metrics = self.glyph_cache.font_metrics();
+
+        let cell_height = size_info.cell_height();
+        let cell_width = size_info.cell_width();
+
+        // Tab bar is at the very top of the window (y=0), not after padding
+        let tab_bar_y = 0.0;
+        let tab_bar_height = size_info.tab_bar_height();
+
+        // Vertical padding within the tab bar (center the text)
+        let text_padding_top = (tab_bar_height - cell_height) / 2.0;
+
+        // Colors: grey background, system accent color for active tab underline
+        let tab_bg = Rgb::new(0x3a, 0x3a, 0x3a); // Grey background
+        let active_underline = cached_accent_color();
+        let fg = config.colors.primary.foreground;
+
+        let num_tabs = tab_titles.len();
+        if num_tabs == 0 {
+            return;
+        }
+
+        // Calculate tab widths on the character grid so the underline aligns with text.
+        let tab_width_px = size_info.width() / num_tabs as f32;
+        let chars_per_tab = (tab_width_px / cell_width) as usize;
+        let grid_tab_width = chars_per_tab as f32 * cell_width;
+        let underline_height = 3.0_f32;
+
+        // Build tab bar rectangles.
+        let mut tab_rects = Vec::new();
+
+        // Tab bar background rectangle (full tab_bar_height).
+        tab_rects.push(RenderRect::new(
+            0.,
+            tab_bar_y,
+            size_info.width(),
+            tab_bar_height,
+            tab_bg,
+            1.,
+        ));
+
+        // Add underline for active tab, aligned to the character grid.
+        // The last tab extends to the window edge to avoid a gap.
+        let underline_x = active_index as f32 * grid_tab_width;
+        let underline_width = if active_index == num_tabs - 1 {
+            size_info.width() - underline_x
+        } else {
+            grid_tab_width
+        };
+        tab_rects.push(RenderRect::new(
+            underline_x,
+            tab_bar_y + tab_bar_height - underline_height,
+            underline_width,
+            underline_height,
+            active_underline,
+            1.,
+        ));
+
+        // Draw tab bar rectangles first.
+        self.renderer.draw_rects(&size_info, &metrics, tab_rects);
+
+        // Create size_info for tab bar text rendering.
+        // Use text_padding_top as the padding_y so text is vertically centered.
+        let tab_bar_size = SizeInfo::new_with_tab_bar(
+            size_info.width(),
+            size_info.height(),
+            cell_width,
+            cell_height,
+            size_info.padding_x(),
+            text_padding_top,
+            false,
+            0.0,
+        );
+
+        // Temporarily update renderer projection for tab bar text.
+        self.renderer.resize(&tab_bar_size);
+
+        // Leave 1 char padding on each side of the title.
+        let max_title_chars = chars_per_tab.saturating_sub(2);
+
+        for (i, title) in tab_titles.iter().enumerate() {
+            // Calculate centered text position within the tab
+            // Use chars() to handle unicode correctly
+            let title_chars: Vec<char> = title.chars().collect();
+            let display_title = if title_chars.len() > max_title_chars && max_title_chars > 1 {
+                let skip = title_chars.len() - max_title_chars + 1;
+                let truncated: String = title_chars[skip..].iter().collect();
+                format!("…{}", truncated)
+            } else {
+                title.clone()
+            };
+            let title_width = display_title.chars().count();
+            let padding_chars = chars_per_tab.saturating_sub(title_width) / 2;
+            let start_col = (i * chars_per_tab) + padding_chars;
+
+            let point = Point::new(0usize, Column(start_col));
+            self.renderer.draw_string(
+                point,
+                fg,
+                tab_bg,
+                display_title.chars(),
+                &tab_bar_size,
+                &mut self.glyph_cache,
+            );
+        }
+
+        // Restore renderer projection for terminal content.
+        self.renderer.resize(&size_info);
     }
 
     /// Draw render timer.

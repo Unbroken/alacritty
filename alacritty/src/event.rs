@@ -15,8 +15,8 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
-#[cfg(unix)]
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -26,6 +26,7 @@ use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalPosition;
 use winit::event::{
     ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
@@ -98,6 +99,10 @@ pub struct Processor {
     global_ipc_options: ParsedOptions,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Tracked screen positions of all windows, for cross-window tab transfer.
+    window_positions: HashMap<WindowId, PhysicalPosition<i32>, RandomState>,
+    /// The window the cursor most recently entered (for Wayland cross-window tab transfer).
+    cursor_window: Option<WindowId>,
 }
 
 impl Processor {
@@ -141,6 +146,8 @@ impl Processor {
             #[cfg(unix)]
             global_ipc_options: Default::default(),
             config_monitor,
+            window_positions: Default::default(),
+            cursor_window: None,
         }
     }
 
@@ -161,7 +168,12 @@ impl Processor {
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
-        self.windows.insert(window_context.id(), window_context);
+        let id = window_context.id();
+        // Track initial window position (inner/client area) for cross-window tab transfer.
+        if let Some(pos) = window_context.display.window.inner_position() {
+            self.window_positions.insert(id, pos);
+        }
+        self.windows.insert(id, window_context);
 
         Ok(())
     }
@@ -190,8 +202,144 @@ impl Processor {
             config_overrides,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
+        let id = window_context.id();
+        // Track initial window position (inner/client area) for cross-window tab transfer.
+        if let Some(pos) = window_context.display.window.inner_position() {
+            self.window_positions.insert(id, pos);
+        }
+        self.windows.insert(id, window_context);
         Ok(())
+    }
+
+    /// Handle transferring a tab from one window to another or to a new window.
+    ///
+    /// Uses two strategies to find the target window:
+    /// 1. Position-based hit testing using tracked window positions (X11).
+    /// 2. `cursor_window` — the window that most recently received CursorEntered
+    ///    (works on Wayland where window positions are unavailable). On Wayland,
+    ///    CursorEntered fires *before* TransferTab in the event queue because the
+    ///    compositor delivers window events before user events.
+    fn handle_transfer_tab(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_window_id: WindowId,
+        tab_index: usize,
+        cursor_x: i32,
+        cursor_y: i32,
+    ) {
+        // Strategy 1: position-based hit testing (X11).
+        let mut target_window_id = if self.window_positions.is_empty() {
+            None
+        } else {
+            let source_pos = self
+                .window_positions
+                .get(&source_window_id)
+                .copied()
+                .unwrap_or(PhysicalPosition::new(0, 0));
+            let abs_x = source_pos.x + cursor_x;
+            let abs_y = source_pos.y + cursor_y;
+            self.find_window_at(abs_x, abs_y, source_window_id)
+        };
+
+        // Strategy 2: use cursor_window from CursorEntered events (Wayland).
+        if target_window_id.is_none()
+            && let Some(cw) = self.cursor_window
+            && cw != source_window_id
+            && self.windows.contains_key(&cw)
+        {
+            target_window_id = Some(cw);
+        }
+
+        // Extract the tab from source window.
+        let source = match self.windows.get_mut(&source_window_id) {
+            Some(wc) => wc,
+            None => return,
+        };
+
+        // If the cursor is still near the source window (e.g. dropped on title bar),
+        // do nothing — the within-window drag already positioned the tab correctly.
+        let source_size = source.display.size_info;
+        let decoration_margin = 50;
+        let near_source = cursor_x >= -decoration_margin
+            && cursor_x < source_size.width() as i32 + decoration_margin
+            && cursor_y >= -decoration_margin
+            && cursor_y < source_size.height() as i32 + decoration_margin;
+
+        if target_window_id.is_none()
+            && (near_source || self.cursor_window == Some(source_window_id))
+        {
+            return;
+        }
+
+        let tab = match source.take_tab(tab_index) {
+            Some(tab) => tab,
+            None => return,
+        };
+
+        let source_should_close = source.should_close_after_take();
+
+        if let Some(target_id) = target_window_id {
+            // Transfer to the target window (receive_tab handles tab_id and EventProxy retargeting).
+            if let Some(target) = self.windows.get_mut(&target_id) {
+                target.receive_tab(tab);
+                target.display.window.focus_window();
+            }
+        } else {
+            // No target — create a new window from the tab.
+            for window_context in self.windows.values_mut() {
+                window_context.display.make_not_current();
+            }
+
+            if let Some(gl_config) = &self.gl_config {
+                match WindowContext::with_tab(
+                    gl_config,
+                    event_loop,
+                    self.proxy.clone(),
+                    self.config.clone(),
+                    tab,
+                    PhysicalPosition::new(0, 0),
+                ) {
+                    Ok(window_context) => {
+                        let id = window_context.id();
+                        self.windows.insert(id, window_context);
+                        if let Some(wc) = self.windows.get(&id) {
+                            wc.display.window.focus_window();
+                        }
+                    },
+                    Err(err) => {
+                        error!("Could not create window from tab: {err:?}");
+                    },
+                }
+            }
+        }
+
+        // Close source window if it has no more tabs.
+        if source_should_close
+            && let Some(source) = self.windows.get_mut(&source_window_id)
+        {
+            source.terminal_mut().exit();
+        }
+    }
+
+    /// Find a window (other than `exclude`) that contains the given screen coordinates.
+    fn find_window_at(&self, abs_x: i32, abs_y: i32, exclude: WindowId) -> Option<WindowId> {
+        for (window_id, window_context) in &self.windows {
+            if *window_id == exclude {
+                continue;
+            }
+            let pos = self
+                .window_positions
+                .get(window_id)
+                .copied()
+                .unwrap_or(PhysicalPosition::new(0, 0));
+            let size = window_context.display.size_info;
+            let w = size.width() as i32;
+            let h = size.height() as i32;
+            if abs_x >= pos.x && abs_x < pos.x + w && abs_y >= pos.y && abs_y < pos.y + h {
+                return Some(*window_id);
+            }
+        }
+        None
     }
 
     /// Run the event loop.
@@ -222,7 +370,6 @@ impl Processor {
                 | WindowEvent::Destroyed
                 | WindowEvent::ThemeChanged(_)
                 | WindowEvent::HoveredFile(_)
-                | WindowEvent::Moved(_)
         )
     }
 }
@@ -254,6 +401,29 @@ impl ApplicationHandler<Event> for Processor {
     ) {
         if self.config.debug.print_events {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
+        }
+
+        // Track window inner (client area) position for cross-window tab transfer.
+        // WindowEvent::Moved gives outer position, so query inner_position from the window.
+        if matches!(event, WindowEvent::Moved(_)) {
+            if let Some(wc) = self.windows.get(&window_id)
+                && let Some(pos) = wc.display.window.inner_position()
+            {
+                self.window_positions.insert(window_id, pos);
+            }
+            return;
+        }
+
+        // Track which window the cursor is in for cross-window tab transfer.
+        // On Wayland, CursorEntered fires before the TransferTab user event,
+        // so this tells handle_transfer_tab which window to target.
+        if matches!(event, WindowEvent::CursorEntered { .. }) {
+            self.cursor_window = Some(window_id);
+        }
+        if matches!(event, WindowEvent::CursorLeft { .. })
+            && self.cursor_window == Some(window_id)
+        {
+            self.cursor_window = None;
         }
 
         // Ignore all events we do not care about.
@@ -369,6 +539,16 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            // Transfer a tab from one window to another (or to a new window).
+            (EventType::TransferTab { tab_index, cursor_x, cursor_y }, Some(source_window_id)) => {
+                self.handle_transfer_tab(
+                    event_loop,
+                    *source_window_id,
+                    tab_index,
+                    cursor_x,
+                    cursor_y,
+                );
+            },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
                 // XXX Ensure that no context is current when creating a new window,
@@ -414,8 +594,50 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    // Update the correct tab's title based on tab_id from event.
+                    // If tab_id is None but tab_group exists, assume it's the initial tab (id 0).
+                    if let Some(ref mut tab_group) = window_context.tab_group {
+                        let tab_id = event.tab_id.unwrap_or(0);
+                        let tab_index = if let Some((idx, tab)) = tab_group.tab_by_id_mut(tab_id) {
+                            tab.title = title.clone();
+                            Some(idx)
+                        } else {
+                            None
+                        };
+                        // Update window title only if this is the active tab.
+                        if tab_index == Some(tab_group.active_index())
+                            && window_context.config().window.dynamic_title
+                        {
+                            window_context.display.window.set_title(title);
+                        }
+                    } else {
+                        // No tab_group means single-window mode, update window title directly.
+                        if window_context.config().window.dynamic_title {
+                            window_context.display.window.set_title(title);
+                        }
+                    }
+                    // Trigger redraw for tab bar.
+                    window_context.display.damage_tracker.frame().mark_fully_damaged();
+                    window_context.dirty = true;
+                }
+            },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                // Remove the closed terminal.
+                // Check if we have multiple tabs - if so, close just the active tab.
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    if let Some(ref tab_group) = window_context.tab_group {
+                        if tab_group.tabs().len() > 1 {
+                            // Close the active tab instead of the whole window.
+                            window_context.close_tab();
+                            window_context.display.damage_tracker.frame().mark_fully_damaged();
+                            window_context.dirty = true;
+                            return;
+                        }
+                    }
+                }
+
+                // Remove the closed terminal (single tab or no tabs).
                 let window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
                     Entry::Occupied(window_context)
@@ -426,8 +648,9 @@ impl ApplicationHandler<Event> for Processor {
                     _ => return,
                 };
 
-                // Unschedule pending events.
+                // Unschedule pending events and clean up tracked position.
                 self.scheduler.unschedule_window(window_context.id());
+                self.window_positions.remove(&window_context.id());
 
                 // Shutdown if no more terminals are open.
                 if self.windows.is_empty() && !self.cli_options.daemon {
@@ -520,15 +743,27 @@ impl ApplicationHandler<Event> for Processor {
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Limit event to a specific window.
-    window_id: Option<WindowId>,
+    pub window_id: Option<WindowId>,
+
+    /// Tab identifier (for multi-tab windows).
+    pub tab_id: Option<usize>,
 
     /// Event payload.
-    payload: EventType,
+    pub payload: EventType,
 }
 
 impl Event {
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
-        Self { window_id: window_id.into(), payload }
+        Self {
+            window_id: window_id.into(),
+            tab_id: None,
+            payload,
+        }
+    }
+
+    pub fn with_tab_id(mut self, tab_id: Option<usize>) -> Self {
+        self.tab_id = tab_id;
+        self
     }
 }
 
@@ -556,6 +791,33 @@ pub enum EventType {
     #[cfg(unix)]
     Shutdown,
     Frame,
+    /// Create a new tab in the window.
+    CreateTab,
+    /// Close the current tab.
+    CloseTab,
+    /// Select the next tab.
+    SelectNextTab,
+    /// Select the previous tab.
+    SelectPreviousTab,
+    /// Select a specific tab by index (0-based).
+    SelectTab(usize),
+    /// Select the last tab.
+    SelectLastTab,
+    /// Move the current tab left.
+    MoveTabLeft,
+    /// Move the current tab right.
+    MoveTabRight,
+    /// Move a tab from one position to another.
+    MoveTab { from: usize, to: usize },
+    /// Transfer a tab to another window (or create a new window).
+    /// Handled at the Processor level, not per-window.
+    TransferTab {
+        tab_index: usize,
+        /// Window-relative cursor x at the time of release.
+        cursor_x: i32,
+        /// Window-relative cursor y at the time of release.
+        cursor_y: i32,
+    },
 }
 
 impl From<TerminalEvent> for EventType {
@@ -685,6 +947,8 @@ pub struct ActionContext<'a, N, T> {
     pub master_fd: RawFd,
     #[cfg(not(windows))]
     pub shell_pid: u32,
+    /// Number of tabs (for tab bar click detection).
+    pub tab_count: usize,
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -900,6 +1164,66 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let _ = self
             .event_proxy
             .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
+    }
+
+    fn create_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::CreateTab, window_id));
+    }
+
+    fn close_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::CloseTab, window_id));
+    }
+
+    fn select_next_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectNextTab, window_id));
+    }
+
+    fn select_previous_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ =
+            self.event_proxy.send_event(Event::new(EventType::SelectPreviousTab, window_id));
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectTab(index), window_id));
+    }
+
+    fn select_last_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectLastTab, window_id));
+    }
+
+    fn move_tab_left(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::MoveTabLeft, window_id));
+    }
+
+    fn move_tab_right(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::MoveTabRight, window_id));
+    }
+
+    fn move_tab_to(&mut self, from: usize, to: usize) {
+        let window_id = self.display.window.id();
+        let _ = self
+            .event_proxy
+            .send_event(Event::new(EventType::MoveTab { from, to }, window_id));
+    }
+
+    fn tab_count(&self) -> usize {
+        self.tab_count
+    }
+
+    fn transfer_tab(&mut self, tab_index: usize, cursor_x: i32, cursor_y: i32) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(
+            EventType::TransferTab { tab_index, cursor_x, cursor_y },
+            window_id,
+        ));
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -1763,6 +2087,21 @@ impl TouchZoom {
     }
 }
 
+/// State for an in-progress tab drag operation.
+#[derive(Debug, Clone, Copy)]
+pub struct TabDragState {
+    /// The current index of the tab being dragged (updated after each swap).
+    pub current_index: usize,
+    /// The x pixel coordinate where the mouse was pressed.
+    pub start_x: usize,
+    /// Whether the drag threshold has been exceeded (drag is "active").
+    pub active: bool,
+    /// Last raw (unclamped) cursor x position, for detecting cross-window drags.
+    pub raw_x: i32,
+    /// Last raw (unclamped) cursor y position, for detecting cross-window drags.
+    pub raw_y: i32,
+}
+
 /// State of the mouse.
 #[derive(Debug)]
 pub struct Mouse {
@@ -1779,6 +2118,8 @@ pub struct Mouse {
     pub inside_text_area: bool,
     pub x: usize,
     pub y: usize,
+    /// Active tab drag state, if a drag is in progress.
+    pub tab_drag: Option<TabDragState>,
 }
 
 impl Default for Mouse {
@@ -1797,6 +2138,7 @@ impl Default for Mouse {
             accumulated_scroll: Default::default(),
             x: Default::default(),
             y: Default::default(),
+            tab_drag: None,
         }
     }
 }
@@ -1811,7 +2153,8 @@ impl Mouse {
         let col = self.x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
         let col = min(Column(col), size.last_column());
 
-        let line = self.y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
+        // Use top_offset to account for both padding and tab bar height.
+        let line = self.y.saturating_sub(size.top_offset() as usize) / (size.cell_height() as usize);
         let line = min(line, size.bottommost_line().0 as usize);
 
         term::viewport_to_point(display_offset, Point::new(line, col))
@@ -1865,11 +2208,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     self.ctx.display.pending_update.dirty = true;
                 },
                 EventType::Terminal(event) => match event {
-                    TerminalEvent::Title(title) => {
-                        if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
-                            self.ctx.window().set_title(title);
-                        }
-                    },
+                    // Title events are handled in the main Processor for proper tab routing.
+                    TerminalEvent::Title(_) => (),
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
@@ -1934,14 +2274,22 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::Frame => (),
+                // Tab events are handled by WindowContext.
+                EventType::CreateTab
+                | EventType::CloseTab
+                | EventType::SelectNextTab
+                | EventType::SelectPreviousTab
+                | EventType::SelectTab(_)
+                | EventType::SelectLastTab
+                | EventType::MoveTabLeft
+                | EventType::MoveTabRight
+                | EventType::MoveTab { .. }
+                | EventType::TransferTab { .. } => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
-                    WindowEvent::CloseRequested => {
-                        // User asked to close the window, so no need to hold it.
-                        self.ctx.window().hold = false;
-                        self.ctx.terminal.exit();
-                    },
+                    // CloseRequested is handled by WindowContext::handle_event.
+                    WindowEvent::CloseRequested => {},
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         let old_scale_factor =
                             mem::replace(&mut self.ctx.window().scale_factor, scale_factor);
@@ -2072,22 +2420,56 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 #[derive(Debug, Clone)]
 pub struct EventProxy {
     proxy: EventLoopProxy<Event>,
-    window_id: WindowId,
+    window_id: Arc<StdMutex<WindowId>>,
+    tab_id: Arc<StdMutex<Option<usize>>>,
 }
 
 impl EventProxy {
     pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+        Self {
+            proxy,
+            window_id: Arc::new(StdMutex::new(window_id)),
+            tab_id: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    /// Create an EventProxy with a tab identifier.
+    pub fn with_tab_id(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: usize) -> Self {
+        Self {
+            proxy,
+            window_id: Arc::new(StdMutex::new(window_id)),
+            tab_id: Arc::new(StdMutex::new(Some(tab_id))),
+        }
+    }
+
+    /// Get the underlying event loop proxy.
+    pub fn event_loop_proxy(&self) -> &EventLoopProxy<Event> {
+        &self.proxy
+    }
+
+    /// Retarget this EventProxy to a different window and tab.
+    ///
+    /// Since window_id and tab_id are shared via Arc, this retargets all clones
+    /// (including the I/O thread's copy).
+    pub fn retarget(&self, new_window_id: WindowId, new_tab_id: Option<usize>) {
+        *self.window_id.lock().unwrap() = new_window_id;
+        *self.tab_id.lock().unwrap() = new_tab_id;
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let window_id = *self.window_id.lock().unwrap();
+        let tab_id = *self.tab_id.lock().unwrap();
+        let event = Event::new(event, window_id).with_tab_id(tab_id);
+        let _ = self.proxy.send_event(event);
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let window_id = *self.window_id.lock().unwrap();
+        let tab_id = *self.tab_id.lock().unwrap();
+        let event = Event::new(event.into(), window_id).with_tab_id(tab_id);
+        let _ = self.proxy.send_event(event);
     }
 }

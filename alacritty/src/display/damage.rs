@@ -226,7 +226,8 @@ impl<'a> RenderDamageIterator<'a> {
     #[inline]
     fn rect_for_line(&self, line_damage: LineDamageBounds) -> Rect {
         let size_info = &self.size_info;
-        let y_top = size_info.height() - size_info.padding_y();
+        // Account for tab bar height when calculating top of terminal content area.
+        let y_top = size_info.height() - size_info.padding_y() - size_info.tab_bar_height();
         let x = size_info.padding_x() + line_damage.left as u32 * size_info.cell_width();
         let y = y_top as i32 - (line_damage.line + 1) as i32 * size_info.cell_height() as i32;
         let width = (line_damage.right - line_damage.left + 1) as u32 * size_info.cell_width();

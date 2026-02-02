@@ -987,6 +987,10 @@ _https://docs.rs/winit/latest/winit/keyboard/enum.Key.html#variant.Dead_
 			Select the ninth tab.
 		*SelectLastTab*
 			Select the last tab.
+		*MoveTabLeft*
+			Move the current tab one position to the left.
+		*MoveTabRight*
+			Move the current tab one position to the right.
 
 		_Linux/BSD exclusive:_
 

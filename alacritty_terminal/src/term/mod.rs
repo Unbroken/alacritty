@@ -444,6 +444,11 @@ impl<T> Term<T> {
         }
     }
 
+    /// Get a reference to the event proxy.
+    pub fn event_proxy(&self) -> &T {
+        &self.event_proxy
+    }
+
     /// Collect the information about the changes in the lines, which
     /// could be used to minimize the amount of drawing operations.
     ///
@@ -708,6 +713,12 @@ impl<T> Term<T> {
     #[inline]
     pub fn mode(&self) -> &TermMode {
         &self.mode
+    }
+
+    /// Get the current window title.
+    #[inline]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// Swap primary and alternate screen buffer.
