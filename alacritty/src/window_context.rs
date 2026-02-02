@@ -21,7 +21,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
-use alacritty_terminal::event::Event as TerminalEvent;
+use alacritty_terminal::event::{Event as TerminalEvent, OnResize};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
@@ -34,14 +34,17 @@ use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
+use crate::display::SizeInfo;
 use crate::display::window::Window;
 use crate::event::{
-    ActionContext, Event, EventProxy, InlineSearchState, Mouse, SearchState, TouchPurpose,
+    ActionContext, Event, EventProxy, EventType, InlineSearchState, Mouse, SearchState,
+    TouchPurpose,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
+use crate::tabs::{Tab, TabGroup};
 use crate::{input, renderer};
 
 /// Event context for one individual Alacritty window.
@@ -50,23 +53,31 @@ pub struct WindowContext {
     pub display: Display,
     pub dirty: bool,
     event_queue: Vec<WinitEvent<Event>>,
+
+    /// Tab group containing all tabs for this window.
+    /// When tabs are enabled, this manages multiple terminals within a single window.
+    pub tab_group: Option<TabGroup>,
+
+    /// Single terminal used when custom tabs are disabled, or when only one tab exists.
     terminal: Arc<FairMutex<Term<EventProxy>>>,
+    notifier: Notifier,
+    #[cfg(not(windows))]
+    master_fd: RawFd,
+    #[cfg(not(windows))]
+    shell_pid: u32,
+
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
     modifiers: Modifiers,
     inline_search_state: InlineSearchState,
     search_state: SearchState,
-    notifier: Notifier,
     mouse: Mouse,
     touch: TouchPurpose,
     occluded: bool,
     preserve_title: bool,
-    #[cfg(not(windows))]
-    master_fd: RawFd,
-    #[cfg(not(windows))]
-    shell_pid: u32,
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
+    event_proxy: EventProxy,
 }
 
 impl WindowContext {
@@ -211,7 +222,7 @@ impl WindowContext {
         // renderer and input processing. Note that access to the terminal state is
         // synchronized since the I/O loop updates the state, and the display
         // consumes it periodically.
-        let event_loop = PtyEventLoop::new(
+        let pty_event_loop = PtyEventLoop::new(
             Arc::clone(&terminal),
             event_proxy.clone(),
             pty,
@@ -221,10 +232,10 @@ impl WindowContext {
 
         // The event loop channel allows write requests from the event processor
         // to be sent to the pty loop and ultimately written to the pty.
-        let loop_tx = event_loop.channel();
+        let loop_tx = pty_event_loop.channel();
 
         // Kick off the I/O thread.
-        let _io_thread = event_loop.spawn();
+        let _io_thread = pty_event_loop.spawn();
 
         // Start cursor blinking, in case `Focused` isn't sent on startup.
         if config.cursor.style().blinking {
@@ -242,6 +253,8 @@ impl WindowContext {
             shell_pid,
             config,
             notifier: Notifier(loop_tx),
+            event_proxy,
+            tab_group: None,
             cursor_blink_timed_out: Default::default(),
             prev_bell_cmd: Default::default(),
             inline_search_state: Default::default(),
@@ -257,6 +270,167 @@ impl WindowContext {
         })
     }
 
+    /// Create a new tab in this window.
+    pub fn create_tab(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.config.tabs.enabled {
+            return Ok(());
+        }
+
+        // Determine if this will be the second tab (when tab bar will first appear).
+        let is_first_new_tab = self.tab_group.is_none();
+
+        // Calculate the correct size_info for the new tab.
+        // If this is the first new tab, we need to account for the tab bar that will appear.
+        let tab_size_info = if is_first_new_tab {
+            // Create a size_info with tab bar height included.
+            let current = &self.display.size_info;
+            SizeInfo::new_with_tab_bar(
+                current.width(),
+                current.height(),
+                current.cell_width(),
+                current.cell_height(),
+                current.padding_x(),
+                current.padding_y(),
+                false,
+                current.cell_height() + 8.0, // tab_bar_height = cell + padding
+            )
+        } else {
+            self.display.size_info
+        };
+
+        // Determine tab_id for the new tab.
+        let new_tab_id = self.tab_group.as_ref().map_or(1, |tg| tg.tabs().len());
+
+        // Create EventProxy with tab_id for proper title routing.
+        let tab_event_proxy = EventProxy::with_tab_id(
+            self.event_proxy.event_loop_proxy().clone(),
+            self.display.window.id(),
+            new_tab_id,
+        );
+
+        let tab = Tab::new(&self.config, &tab_size_info, tab_event_proxy, new_tab_id)?;
+
+        match &mut self.tab_group {
+            Some(tab_group) => {
+                tab_group.add_tab(tab);
+            },
+            None => {
+                // First time creating a tab - migrate the existing terminal to a TabGroup
+                // Get current title from terminal for the initial tab.
+                let initial_title = self.terminal.lock()
+                    .title()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| self.config.window.identity.title.clone());
+                let initial_tab = Tab {
+                    terminal: Arc::clone(&self.terminal),
+                    notifier: Notifier(self.notifier.0.clone()),
+                    title: initial_title,
+                    #[cfg(not(windows))]
+                    master_fd: self.master_fd,
+                    #[cfg(not(windows))]
+                    shell_pid: self.shell_pid,
+                };
+                let mut tab_group = TabGroup::new(initial_tab);
+                tab_group.add_tab(tab);
+                self.tab_group = Some(tab_group);
+
+                // Resize the first tab's terminal to account for the new tab bar.
+                // The first tab's terminal currently has the old size without tab bar.
+                self.terminal.lock().resize(tab_size_info);
+                let _ = self.notifier.0.send(Msg::Resize(tab_size_info.into()));
+            },
+        }
+
+        // Update tab bar visibility - show tab bar when we have 2+ tabs.
+        let tab_count = self.tab_group.as_ref().map_or(1, |tg| tg.tabs().len());
+        self.display.set_tab_bar_visible(tab_count > 1);
+
+        // Mark entire display as damaged to force full redraw.
+        self.display.damage_tracker.frame().mark_fully_damaged();
+
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Close the current tab. Returns true if the window should close.
+    pub fn close_tab(&mut self) -> bool {
+        if let Some(tab_group) = &mut self.tab_group {
+            if !tab_group.close_active_tab() {
+                // Last tab - window should close
+                return true;
+            }
+
+            // Update tab bar visibility - hide tab bar when we have 1 or fewer tabs.
+            let tab_count = tab_group.tabs().len();
+            self.display.set_tab_bar_visible(tab_count > 1);
+
+            // Mark entire display as damaged to force full redraw.
+            self.display.damage_tracker.frame().mark_fully_damaged();
+
+            self.dirty = true;
+            false
+        } else {
+            // No tabs - window should close
+            true
+        }
+    }
+
+    /// Select the next tab.
+    pub fn select_next_tab(&mut self) {
+        if let Some(tab_group) = &mut self.tab_group {
+            tab_group.select_next_tab();
+            // Mark entire display as damaged to force full redraw when switching tabs.
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.dirty = true;
+        }
+        // Update window title to match active tab.
+        self.sync_window_title_to_active_tab();
+    }
+
+    /// Select the previous tab.
+    pub fn select_previous_tab(&mut self) {
+        if let Some(tab_group) = &mut self.tab_group {
+            tab_group.select_previous_tab();
+            // Mark entire display as damaged to force full redraw when switching tabs.
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.dirty = true;
+        }
+        // Update window title to match active tab.
+        self.sync_window_title_to_active_tab();
+    }
+
+    /// Select a tab by index (0-based).
+    pub fn select_tab(&mut self, index: usize) {
+        if let Some(tab_group) = &mut self.tab_group {
+            tab_group.select_tab(index);
+            // Mark entire display as damaged to force full redraw when switching tabs.
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.dirty = true;
+        }
+        // Update window title to match active tab.
+        self.sync_window_title_to_active_tab();
+    }
+
+    /// Select the last tab.
+    pub fn select_last_tab(&mut self) {
+        if let Some(tab_group) = &mut self.tab_group {
+            tab_group.select_last_tab();
+            // Mark entire display as damaged to force full redraw when switching tabs.
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.dirty = true;
+        }
+        // Update window title to match active tab.
+        self.sync_window_title_to_active_tab();
+    }
+
+    /// Update window title to match the active tab's title.
+    pub fn sync_window_title_to_active_tab(&mut self) {
+        if let Some(tab_group) = &self.tab_group {
+            let title = tab_group.active_tab().title.clone();
+            self.display.window.set_title(title);
+        }
+    }
+
     /// Update the terminal window to the latest config.
     pub fn update_config(&mut self, new_config: Rc<UiConfig>) {
         let old_config = mem::replace(&mut self.config, new_config);
@@ -266,6 +440,14 @@ impl WindowContext {
 
         self.display.update_config(&self.config);
         self.terminal.lock().set_options(self.config.term_options());
+
+        // Update term options for all tab terminals.
+        if let Some(tab_group) = &mut self.tab_group {
+            let options = self.config.term_options();
+            for tab in tab_group.tabs_mut() {
+                tab.terminal.lock().set_options(options.clone());
+            }
+        }
 
         // Reload cursor if its thickness has changed.
         if (old_config.cursor.thickness() - self.config.cursor.thickness()).abs() > f32::EPSILON {
@@ -333,7 +515,6 @@ impl WindowContext {
     }
 
     /// Get reference to the window's configuration.
-    #[cfg(unix)]
     pub fn config(&self) -> &UiConfig {
         &self.config
     }
@@ -386,14 +567,41 @@ impl WindowContext {
             }
         }
 
+        // Get the active terminal (from tab group if present, otherwise the main terminal).
+        let active_terminal = if let Some(tg) = &self.tab_group {
+            Arc::clone(&tg.active_tab().terminal)
+        } else {
+            Arc::clone(&self.terminal)
+        };
+
         // Redraw the window.
-        let terminal = self.terminal.lock();
+        let terminal = active_terminal.lock();
+
+        // Draw tab bar only if tabs are enabled AND there are 2+ tabs.
+        let tab_info = if self.config.tabs.enabled {
+            if let Some(tg) = &self.tab_group {
+                // Only show tab bar when there are multiple tabs.
+                if tg.tabs().len() > 1 {
+                    let titles: Vec<String> =
+                        tg.tabs().iter().map(|t| t.title.clone()).collect();
+                    Some((titles, tg.active_index()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         self.display.draw(
             terminal,
             scheduler,
             &self.message_buffer,
             &self.config,
             &mut self.search_state,
+            tab_info,
         );
     }
 
@@ -406,6 +614,42 @@ impl WindowContext {
         scheduler: &mut Scheduler,
         event: WinitEvent<Event>,
     ) {
+        // Handle tab events directly before queueing.
+        if let WinitEvent::UserEvent(Event { payload, .. }) = &event {
+            match payload {
+                EventType::CreateTab => {
+                    if let Err(err) = self.create_tab() {
+                        log::error!("Failed to create tab: {err}");
+                    }
+                    return;
+                },
+                EventType::CloseTab => {
+                    if self.close_tab() {
+                        // Last tab closed - exit the terminal to close the window
+                        self.terminal.lock().exit();
+                    }
+                    return;
+                },
+                EventType::SelectNextTab => {
+                    self.select_next_tab();
+                    return;
+                },
+                EventType::SelectPreviousTab => {
+                    self.select_previous_tab();
+                    return;
+                },
+                EventType::SelectTab(index) => {
+                    self.select_tab(*index);
+                    return;
+                },
+                EventType::SelectLastTab => {
+                    self.select_last_tab();
+                    return;
+                },
+                _ => {},
+            }
+        }
+
         match event {
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -422,7 +666,39 @@ impl WindowContext {
             },
         }
 
-        let mut terminal = self.terminal.lock();
+        // Get tab count before mutable borrows (for tab bar click detection).
+        let tab_count = self.tab_group.as_ref().map_or(0, |tg| tg.tabs().len());
+
+        // Get the active terminal and notifier (from tab group if present).
+        #[cfg(not(windows))]
+        let (active_terminal_arc, active_notifier, active_master_fd, active_shell_pid) =
+            if let Some(tg) = &mut self.tab_group {
+                let tab = tg.active_tab_mut();
+                (
+                    Arc::clone(&tab.terminal),
+                    &mut tab.notifier,
+                    tab.master_fd,
+                    tab.shell_pid,
+                )
+            } else {
+                (
+                    Arc::clone(&self.terminal),
+                    &mut self.notifier,
+                    self.master_fd,
+                    self.shell_pid,
+                )
+            };
+
+        #[cfg(windows)]
+        let (active_terminal_arc, active_notifier) =
+            if let Some(tg) = &mut self.tab_group {
+                let tab = tg.active_tab_mut();
+                (Arc::clone(&tab.terminal), &mut tab.notifier)
+            } else {
+                (Arc::clone(&self.terminal), &mut self.notifier)
+            };
+
+        let mut terminal = active_terminal_arc.lock();
 
         let old_is_searching = self.search_state.history_index.is_some();
 
@@ -433,7 +709,7 @@ impl WindowContext {
             inline_search_state: &mut self.inline_search_state,
             search_state: &mut self.search_state,
             modifiers: &mut self.modifiers,
-            notifier: &mut self.notifier,
+            notifier: active_notifier,
             display: &mut self.display,
             mouse: &mut self.mouse,
             touch: &mut self.touch,
@@ -441,9 +717,9 @@ impl WindowContext {
             occluded: &mut self.occluded,
             terminal: &mut terminal,
             #[cfg(not(windows))]
-            master_fd: self.master_fd,
+            master_fd: active_master_fd,
             #[cfg(not(windows))]
-            shell_pid: self.shell_pid,
+            shell_pid: active_shell_pid,
             preserve_title: self.preserve_title,
             config: &self.config,
             event_proxy,
@@ -451,25 +727,53 @@ impl WindowContext {
             event_loop,
             clipboard,
             scheduler,
+            tab_count,
         };
-        let mut processor = input::Processor::new(context);
+        // Scope the processor to release borrows before submit_display_update.
+        {
+            let mut processor = input::Processor::new(context);
 
-        for event in self.event_queue.drain(..) {
-            processor.handle_event(event);
+            for event in self.event_queue.drain(..) {
+                processor.handle_event(event);
+            }
         }
 
         // Process DisplayUpdate events.
         if self.display.pending_update.dirty {
+            // Get the active notifier again (fresh borrow after processor scope ends).
+            let notifier = if let Some(tg) = &mut self.tab_group {
+                &mut tg.active_tab_mut().notifier
+            } else {
+                &mut self.notifier
+            };
+
             Self::submit_display_update(
                 &mut terminal,
                 &mut self.display,
-                &mut self.notifier,
+                notifier,
                 &self.message_buffer,
                 &mut self.search_state,
                 old_is_searching,
                 &self.config,
             );
             self.dirty = true;
+
+            // Propagate size changes to inactive tabs.
+            if let Some(tab_group) = &mut self.tab_group {
+                let new_size = self.display.size_info;
+                let active_idx = tab_group.active_index();
+                for (i, tab) in tab_group.tabs_mut().iter_mut().enumerate() {
+                    if i != active_idx {
+                        let mut term = tab.terminal.lock();
+                        if term.screen_lines() != new_size.screen_lines()
+                            || term.columns() != new_size.columns()
+                        {
+                            tab.notifier.on_resize(new_size.into());
+                            term.resize(new_size);
+                        }
+                    }
+                }
+            }
         }
 
         if self.dirty || self.mouse.hint_highlight_dirty {
@@ -562,7 +866,12 @@ impl WindowContext {
 
 impl Drop for WindowContext {
     fn drop(&mut self) {
-        // Shutdown the terminal's PTY.
+        // Tab group handles its own cleanup via Tab::drop.
+        if self.tab_group.is_some() {
+            return;
+        }
+
+        // Shutdown the terminal's PTY for non-tabbed mode.
         let _ = self.notifier.0.send(Msg::Shutdown);
     }
 }

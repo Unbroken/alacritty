@@ -411,8 +411,48 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    // Update the correct tab's title based on tab_id from event.
+                    // If tab_id is None but tab_group exists, assume it's tab 0
+                    // (the initial terminal created before tabs were enabled).
+                    if let Some(ref mut tab_group) = window_context.tab_group {
+                        let tab_id = event.tab_id.unwrap_or(0);
+                        if let Some(tab) = tab_group.tabs_mut().get_mut(tab_id) {
+                            tab.title = title.clone();
+                        }
+                        // Update window title only if this is the active tab.
+                        if tab_group.active_index() == tab_id
+                            && window_context.config().window.dynamic_title
+                        {
+                            window_context.display.window.set_title(title);
+                        }
+                    } else {
+                        // No tab_group means single-window mode, update window title directly.
+                        if window_context.config().window.dynamic_title {
+                            window_context.display.window.set_title(title);
+                        }
+                    }
+                    // Trigger redraw for tab bar.
+                    window_context.display.damage_tracker.frame().mark_fully_damaged();
+                    window_context.dirty = true;
+                }
+            },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                // Remove the closed terminal.
+                // Check if we have multiple tabs - if so, close just the active tab.
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    if let Some(ref tab_group) = window_context.tab_group {
+                        if tab_group.tabs().len() > 1 {
+                            // Close the active tab instead of the whole window.
+                            window_context.close_tab();
+                            window_context.display.damage_tracker.frame().mark_fully_damaged();
+                            window_context.dirty = true;
+                            return;
+                        }
+                    }
+                }
+
+                // Remove the closed terminal (single tab or no tabs).
                 let window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
                     Entry::Occupied(window_context)
@@ -517,15 +557,27 @@ impl ApplicationHandler<Event> for Processor {
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Limit event to a specific window.
-    window_id: Option<WindowId>,
+    pub window_id: Option<WindowId>,
+
+    /// Tab identifier (for multi-tab windows).
+    pub tab_id: Option<usize>,
 
     /// Event payload.
-    payload: EventType,
+    pub payload: EventType,
 }
 
 impl Event {
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
-        Self { window_id: window_id.into(), payload }
+        Self {
+            window_id: window_id.into(),
+            tab_id: None,
+            payload,
+        }
+    }
+
+    pub fn with_tab_id(mut self, tab_id: Option<usize>) -> Self {
+        self.tab_id = tab_id;
+        self
     }
 }
 
@@ -551,6 +603,18 @@ pub enum EventType {
     BlinkCursorTimeout,
     SearchNext,
     Frame,
+    /// Create a new tab in the window.
+    CreateTab,
+    /// Close the current tab.
+    CloseTab,
+    /// Select the next tab.
+    SelectNextTab,
+    /// Select the previous tab.
+    SelectPreviousTab,
+    /// Select a specific tab by index (0-based).
+    SelectTab(usize),
+    /// Select the last tab.
+    SelectLastTab,
 }
 
 impl From<TerminalEvent> for EventType {
@@ -680,6 +744,8 @@ pub struct ActionContext<'a, N, T> {
     pub master_fd: RawFd,
     #[cfg(not(windows))]
     pub shell_pid: u32,
+    /// Number of tabs (for tab bar click detection).
+    pub tab_count: usize,
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -895,6 +961,34 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let _ = self
             .event_proxy
             .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
+    }
+
+    fn create_tab(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::CreateTab, None));
+    }
+
+    fn close_tab(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::CloseTab, None));
+    }
+
+    fn select_next_tab(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectNextTab, None));
+    }
+
+    fn select_previous_tab(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectPreviousTab, None));
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectTab(index), None));
+    }
+
+    fn select_last_tab(&mut self) {
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectLastTab, None));
+    }
+
+    fn tab_count(&self) -> usize {
+        self.tab_count
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -1806,7 +1900,8 @@ impl Mouse {
         let col = self.x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
         let col = min(Column(col), size.last_column());
 
-        let line = self.y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
+        // Use top_offset to account for both padding and tab bar height.
+        let line = self.y.saturating_sub(size.top_offset() as usize) / (size.cell_height() as usize);
         let line = min(line, size.bottommost_line().0 as usize);
 
         term::viewport_to_point(display_offset, Point::new(line, col))
@@ -1860,11 +1955,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     self.ctx.display.pending_update.dirty = true;
                 },
                 EventType::Terminal(event) => match event {
-                    TerminalEvent::Title(title) => {
-                        if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
-                            self.ctx.window().set_title(title);
-                        }
-                    },
+                    // Title events are handled in the main Processor for proper tab routing.
+                    TerminalEvent::Title(_) => (),
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
@@ -1929,6 +2021,13 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::Frame => (),
+                // Tab events are handled by WindowContext.
+                EventType::CreateTab
+                | EventType::CloseTab
+                | EventType::SelectNextTab
+                | EventType::SelectPreviousTab
+                | EventType::SelectTab(_)
+                | EventType::SelectLastTab => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -2068,21 +2167,38 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 pub struct EventProxy {
     proxy: EventLoopProxy<Event>,
     window_id: WindowId,
+    tab_id: Option<usize>,
 }
 
 impl EventProxy {
     pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+        Self {
+            proxy,
+            window_id,
+            tab_id: None,
+        }
+    }
+
+    /// Create an EventProxy with a tab identifier.
+    pub fn with_tab_id(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: usize) -> Self {
+        Self { proxy, window_id, tab_id: Some(tab_id) }
+    }
+
+    /// Get the underlying event loop proxy.
+    pub fn event_loop_proxy(&self) -> &EventLoopProxy<Event> {
+        &self.proxy
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let event = Event::new(event, self.window_id).with_tab_id(self.tab_id);
+        let _ = self.proxy.send_event(event);
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let event = Event::new(event.into(), self.window_id).with_tab_id(self.tab_id);
+        let _ = self.proxy.send_event(event);
     }
 }

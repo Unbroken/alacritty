@@ -146,7 +146,8 @@ impl RenderLine {
 
         RenderRect::new(
             start_x + size.padding_x(),
-            y + size.padding_y(),
+            // Use top_offset to account for both padding and tab bar height.
+            y + size.top_offset(),
             width,
             thickness,
             color,
@@ -465,7 +466,8 @@ impl RectShaderProgram {
         let position = (0.5 * metrics.descent).abs();
         let underline_position = metrics.descent.abs() - metrics.underline_position.abs();
 
-        let viewport_height = size_info.height() - size_info.padding_y();
+        // Account for tab bar height in the viewport height calculation.
+        let viewport_height = size_info.height() - size_info.padding_y() - size_info.tab_bar_height();
         let padding_y = viewport_height
             - (viewport_height / size_info.cell_height()).floor() * size_info.cell_height();
 
