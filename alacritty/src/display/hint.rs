@@ -426,9 +426,17 @@ pub fn highlighted_at<T>(
 ///
 /// This will only return contiguous cells, even if another hyperlink with the same ID exists.
 fn hyperlink_at<T>(term: &Term<T>, point: Point) -> Option<(Hyperlink, Match)> {
-    let hyperlink = term.grid()[point].hyperlink()?;
-
     let grid = term.grid();
+
+    // Bounds check to prevent panic.
+    if point.column.0 >= grid.columns()
+        || point.line.0 >= grid.screen_lines() as i32
+        || point.line.0 < -(grid.history_size() as i32)
+    {
+        return None;
+    }
+
+    let hyperlink = grid[point].hyperlink()?;
 
     let mut match_end = point;
     for cell in grid.iter_from(point) {

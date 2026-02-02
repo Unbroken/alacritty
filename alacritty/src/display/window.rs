@@ -463,8 +463,9 @@ impl Window {
         // the text.
         let offset = if self.is_x11 { 1 } else { 0 };
         let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
+        // Use top_offset to account for both padding and tab bar height.
         let nspot_y =
-            f64::from(size.padding_y() + (point.line + offset) as f32 * size.cell_height());
+            f64::from(size.top_offset() + (point.line + offset) as f32 * size.cell_height());
 
         // NOTE: some compositors don't like excluding too much and try to render popup at the
         // bottom right corner of the provided area, so exclude just the full-width char to not

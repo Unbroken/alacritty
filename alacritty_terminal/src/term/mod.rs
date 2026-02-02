@@ -710,6 +710,12 @@ impl<T> Term<T> {
         &self.mode
     }
 
+    /// Get the current window title.
+    #[inline]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
