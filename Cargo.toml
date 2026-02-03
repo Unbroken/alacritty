@@ -9,7 +9,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.90.0"
 
 [profile.release]
 lto = "thin"
@@ -22,4 +22,5 @@ toml_edit = "0.24.0"
 
 # TODO: Validation of fix for #6978. Remove before next release and use released `x11-clipboard`.
 [patch.crates-io]
+crossfont = { git = "https://github.com/Unbroken/crossfont.git", rev = "e1cfb0b43b6502822a29a98eb2482193bbff9df1" }
 x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "19ab2163cf0bd0db607e827a5214571990307866" }

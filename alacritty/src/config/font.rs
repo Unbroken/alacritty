@@ -8,6 +8,28 @@ use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
 
 use crate::config::ui_config::Delta;
 
+/// Font rendering mode for anti-aliasing.
+#[derive(ConfigDeserialize, Serialize, Default, Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FontRendering {
+    /// No anti-aliasing, grid-fitted pixel rendering.
+    Aliased,
+    /// Grayscale anti-aliasing.
+    #[default]
+    Grayscale,
+    /// Subpixel (ClearType) rendering.
+    Subpixel,
+}
+
+impl From<FontRendering> for crossfont::RenderingMode {
+    fn from(rendering: FontRendering) -> crossfont::RenderingMode {
+        match rendering {
+            FontRendering::Aliased => crossfont::RenderingMode::Aliased,
+            FontRendering::Grayscale => crossfont::RenderingMode::Grayscale,
+            FontRendering::Subpixel => crossfont::RenderingMode::Subpixel,
+        }
+    }
+}
+
 /// Font config.
 ///
 /// Defaults are provided at the level of this struct per platform, but not per
@@ -24,6 +46,12 @@ pub struct Font {
 
     #[config(removed = "set the AppleFontSmoothing user default instead")]
     pub use_thin_strokes: bool,
+
+    /// Font rendering mode (grayscale or subpixel).
+    pub rendering: FontRendering,
+
+    /// Whether to use grid fitting (hinting) for font rendering.
+    pub grid_fitting: bool,
 
     /// Normal font face.
     normal: FontDescription,
@@ -80,8 +108,10 @@ impl Default for Font {
     fn default() -> Font {
         Self {
             builtin_box_drawing: true,
+            grid_fitting: false,
             glyph_offset: Default::default(),
             use_thin_strokes: Default::default(),
+            rendering: Default::default(),
             bold_italic: Default::default(),
             italic: Default::default(),
             offset: Default::default(),

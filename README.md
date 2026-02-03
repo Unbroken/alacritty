@@ -1,4 +1,4 @@
-> **Note:** This repository is a macOS-focused fork. For a summary of the user-facing differences, see [FORK_NOTES.md](./FORK_NOTES.md).
+> **Note:** This repository is a fork with an improved macOS experience (Display P3 color, signed & notarized builds, modern icon, edge-to-edge fullscreen), cross-platform tab support, and better Windows font rendering. For the full list, see [FORK_NOTES.md](./FORK_NOTES.md).
 
 <p align="center">
     <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/Unbroken/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
@@ -102,10 +102,9 @@ usecases.
 **_Why isn't feature X implemented?_**
 
 Alacritty has many great features, but not every feature from every other
-terminal. This could be for a number of reasons, but sometimes it's just not a
-good fit for Alacritty. This means you won't find things like tabs or splits
-(which are best left to a window manager or [terminal multiplexer][tmux]) nor
-niceties like a GUI config editor.
+terminal. This fork is more open to adding useful features — for example, it
+ships with built-in tab support — and welcomes pull requests for well-crafted
+additions.
 
 [tmux]: https://github.com/tmux/tmux
 

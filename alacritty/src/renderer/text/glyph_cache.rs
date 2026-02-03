@@ -80,6 +80,9 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     pub fn new(mut rasterizer: Rasterizer, font: &Font) -> Result<GlyphCache, crossfont::Error> {
+        rasterizer.set_rendering_mode(font.rendering.into());
+        rasterizer.set_grid_fitting(font.grid_fitting);
+
         let (regular, bold, italic, bold_italic) = Self::compute_font_keys(font, &mut rasterizer)?;
 
         let metrics = GlyphCache::load_font_metrics(&mut rasterizer, font, regular)?;
@@ -281,6 +284,10 @@ impl GlyphCache {
     /// NOTE: To reload the renderers's fonts [`Self::reset_glyph_cache`] should be called
     /// afterwards.
     pub fn update_font_size(&mut self, font: &Font) -> Result<(), crossfont::Error> {
+        // Update rendering mode and grid fitting.
+        self.rasterizer.set_rendering_mode(font.rendering.into());
+        self.rasterizer.set_grid_fitting(font.grid_fitting);
+
         // Update dpi scaling.
         self.font_offset = font.offset;
         self.glyph_offset = font.glyph_offset;
