@@ -291,6 +291,97 @@ macOS:     { family = _"Menlo"_,     style = _"Regular"_ }
 
 	Default: _true_
 
+*rendering* = _"Aliased"_ | _"Grayscale"_ | _"Subpixel"_ _(Windows only)_
+
+	Font rendering (anti-aliasing) mode.
+
+	Default: _"Grayscale"_
+
+*grid_fitting* = _true_ | _false_ _(Windows only)_
+
+	Whether to use grid fitting (hinting) for font rendering.
+
+	Default: _false_
+
+*[[font.dpi_override]]*
+
+	Override font settings when the window's DPI scale factor meets or exceeds
+	a threshold. This is useful for switching to a different font family
+	optimized for high-DPI or low-DPI displays.
+
+	Multiple overrides can be specified. The override with the highest
+	_min\_scale_ that is still less than or equal to the current scale factor
+	wins. All fields are optional; only specified fields replace the base
+	*[font]* values.
+
+	*min_scale* = _<float>_
+
+		Minimum scale factor for this override to activate.
+
+		Default: _0.0_
+
+	*normal* = { family = _"<string>"_, style = _"<string>"_ }
+
+		Override for the normal font face. Both fields are optional.
+
+	*bold* = { family = _"<string>"_, style = _"<string>"_ }
+
+		Override for the bold font face. Both fields are optional.
+
+	*italic* = { family = _"<string>"_, style = _"<string>"_ }
+
+		Override for the italic font face. Both fields are optional.
+
+	*bold_italic* = { family = _"<string>"_, style = _"<string>"_ }
+
+		Override for the bold italic font face. Both fields are optional.
+
+	*size*, *rendering*, *grid_fitting*, *offset*, *glyph_offset*
+
+		Same as the corresponding *[font]* options above.
+
+	Example: use "Unbroken Retina" at 2x DPI and "Unbroken" otherwise:
+
+```
+[font]
+size = 7.5
+
+[font.normal]
+family = "Unbroken"
+style = "Regular"
+
+[font.bold]
+family = "Unbroken"
+style = "Bold"
+
+[font.italic]
+family = "Unbroken"
+style = "Italic"
+
+[font.bold_italic]
+family = "Unbroken"
+style = "Bold Italic"
+
+[[font.dpi_override]]
+min_scale = 2.0
+
+[font.dpi_override.normal]
+family = "Unbroken Retina"
+style = "Regular"
+
+[font.dpi_override.bold]
+family = "Unbroken Retina"
+style = "Bold"
+
+[font.dpi_override.italic]
+family = "Unbroken Retina"
+style = "Italic"
+
+[font.dpi_override.bold_italic]
+family = "Unbroken Retina"
+style = "Bold Italic"
+```
+
 # COLORS
 
 This section documents the *[colors]* table of the configuration file.
