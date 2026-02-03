@@ -8,3 +8,4 @@ This build of Alacritty focuses on an improved macOS experience. Here’s what y
 - Every macOS build is **signed** and **notarized by Apple**. You can install it without bypassing Gatekeeper prompts or running `xattr` commands.
 - **Tabs** supported out of the box on all platforms. On macOS, set `tabs.enabled = true` to use the custom tab bar instead of native tabs (requires restart).
 - Better font rendering on Windows
+- **DPI-aware font switching**: configure different fonts for different scale factors using `[[font.dpi_override]]`. For example, use a retina-optimized font at 2x and a standard font at 1x.
