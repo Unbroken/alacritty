@@ -7,3 +7,4 @@ This build of Alacritty focuses on an improved macOS experience. Here’s what y
 - **Sharper fullscreen**: the terminal now reaches every edge of the screen with no padding, maximizing lines and columns.
 - Every macOS build is **signed** and **notarized by Apple**. You can install it without bypassing Gatekeeper prompts or running `xattr` commands.
 - **Tabs** supported out of the box on all platforms. On macOS, set `tabs.enabled = true` to use the custom tab bar instead of native tabs (requires restart).
+- Better font rendering on Windows
