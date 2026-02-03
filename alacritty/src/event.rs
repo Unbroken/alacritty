@@ -382,12 +382,12 @@ impl ApplicationHandler<Event> for Processor {
             return;
         }
 
-        if let Some(window_options) = self.initial_window_options.take() {
-            if let Err(err) = self.create_initial_window(event_loop, window_options) {
-                self.initial_window_error = Some(err);
-                event_loop.exit();
-                return;
-            }
+        if let Some(window_options) = self.initial_window_options.take()
+            && let Err(err) = self.create_initial_window(event_loop, window_options)
+        {
+            self.initial_window_error = Some(err);
+            event_loop.exit();
+            return;
         }
 
         info!("Initialisation complete");
@@ -622,16 +622,15 @@ impl ApplicationHandler<Event> for Processor {
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
                 // Check if we have multiple tabs - if so, close just the active tab.
-                if let Some(window_context) = self.windows.get_mut(window_id) {
-                    if let Some(ref tab_group) = window_context.tab_group {
-                        if tab_group.tabs().len() > 1 {
-                            // Close the active tab instead of the whole window.
-                            window_context.close_tab();
-                            window_context.display.damage_tracker.frame().mark_fully_damaged();
-                            window_context.dirty = true;
-                            return;
-                        }
-                    }
+                if let Some(window_context) = self.windows.get_mut(window_id)
+                    && let Some(ref tab_group) = window_context.tab_group
+                    && tab_group.tabs().len() > 1
+                {
+                    // Close the active tab instead of the whole window.
+                    window_context.close_tab();
+                    window_context.display.damage_tracker.frame().mark_fully_damaged();
+                    window_context.dirty = true;
+                    return;
                 }
 
                 // Remove the closed terminal (single tab or no tabs).
@@ -2222,16 +2221,15 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.ctx.display.visual_bell.ring();
 
                         // Execute bell command.
-                        if let Some(bell_command) = &self.ctx.config.bell.command {
-                            if self
+                        if let Some(bell_command) = &self.ctx.config.bell.command
+                            && self
                                 .ctx
                                 .prev_bell_cmd
                                 .is_none_or(|i| i.elapsed() >= BELL_CMD_COOLDOWN)
-                            {
-                                self.ctx.spawn_daemon(bell_command.program(), bell_command.args());
+                        {
+                            self.ctx.spawn_daemon(bell_command.program(), bell_command.args());
 
-                                *self.ctx.prev_bell_cmd = Some(Instant::now());
-                            }
+                            *self.ctx.prev_bell_cmd = Some(Instant::now());
                         }
                     },
                     TerminalEvent::ClipboardStore(clipboard_type, content) => {
