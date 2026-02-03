@@ -447,13 +447,15 @@ impl WindowContext {
         }
 
         if old_config.font != self.config.font {
-            let scale_factor = self.display.window.scale_factor as f32;
+            let scale_factor = self.display.window.scale_factor;
+            let old_resolved = old_config.font.resolve_for_scale(scale_factor);
+            let new_resolved = self.config.font.resolve_for_scale(scale_factor);
             // Do not update font size if it has been changed at runtime.
-            if self.display.font_size == old_config.font.size().scale(scale_factor) {
-                self.display.font_size = self.config.font.size().scale(scale_factor);
+            if self.display.font_size == old_resolved.size().scale(scale_factor as f32) {
+                self.display.font_size = new_resolved.size().scale(scale_factor as f32);
             }
 
-            let font = self.config.font.clone().with_size(self.display.font_size);
+            let font = new_resolved.with_size(self.display.font_size);
             self.display.pending_update.set_font(font);
         }
 
