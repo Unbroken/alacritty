@@ -511,6 +511,11 @@ impl WindowContext {
         self.terminal.lock()
     }
 
+    /// Get the base terminal Arc (for focus checking from Processor level).
+    pub fn terminal_arc(&self) -> &Arc<FairMutex<Term<EventProxy>>> {
+        &self.terminal
+    }
+
     /// Select the next tab.
     pub fn select_next_tab(&mut self) {
         if let Some(tab_group) = &mut self.tab_group {

@@ -20,6 +20,9 @@ pub struct BellConfig {
 
     /// Visual bell duration in milliseconds.
     duration: u16,
+
+    /// Send desktop notification on bell when window/tab is not active.
+    pub notification: bool,
 }
 
 impl Default for BellConfig {
@@ -29,6 +32,7 @@ impl Default for BellConfig {
             animation: Default::default(),
             command: Default::default(),
             duration: Default::default(),
+            notification: true,
         }
     }
 }

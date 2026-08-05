@@ -63,6 +63,7 @@ use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
 #[cfg(unix)]
 use crate::polling::ipc::{self, SocketReply};
+use crate::notify::DesktopNotifier;
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::window_context::WindowContext;
 
@@ -103,6 +104,7 @@ pub struct Processor {
     window_positions: HashMap<WindowId, PhysicalPosition<i32>, RandomState>,
     /// The window the cursor most recently entered (for Wayland cross-window tab transfer).
     cursor_window: Option<WindowId>,
+    desktop_notifier: DesktopNotifier,
 }
 
 impl Processor {
@@ -133,6 +135,8 @@ impl Processor {
                 ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
         }
 
+        let desktop_notifier = DesktopNotifier::new(proxy.clone());
+
         Processor {
             initial_window_options,
             initial_window_error: None,
@@ -148,6 +152,7 @@ impl Processor {
             config_monitor,
             window_positions: Default::default(),
             cursor_window: None,
+            desktop_notifier,
         }
     }
 
@@ -437,6 +442,7 @@ impl ApplicationHandler<Event> for Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
+        let is_focused = matches!(event, WindowEvent::Focused(true));
 
         window_context.handle_event(
             #[cfg(target_os = "macos")]
@@ -449,6 +455,23 @@ impl ApplicationHandler<Event> for Processor {
 
         if is_redraw {
             window_context.draw(&mut self.scheduler);
+        }
+
+        // Clear notifications when window gains focus.
+        if is_focused {
+            // On Windows: check for pending notification click heuristic.
+            #[cfg(windows)]
+            if let Some(tab_id) = self.desktop_notifier.check_pending_click(window_id) {
+                let _ = self.proxy.send_event(Event::new(
+                    EventType::FocusTab { window_id, tab_id: Some(tab_id) },
+                    window_id,
+                ));
+            }
+
+            // Clear notification for the now-focused active tab.
+            let active_tab_id =
+                window_context.tab_group.as_ref().map(|tg| tg.active_tab().tab_id);
+            self.desktop_notifier.clear(window_id, active_tab_id);
         }
     }
 
@@ -636,6 +659,9 @@ impl ApplicationHandler<Event> for Processor {
                     return;
                 }
 
+                // Clear all notifications for this window.
+                self.desktop_notifier.clear_all_for_window(*window_id);
+
                 // Remove the closed terminal (single tab or no tabs).
                 let window_context = match self.windows.entry(*window_id) {
                     // Don't exit when terminal exits if user asked to hold the window.
@@ -668,6 +694,102 @@ impl ApplicationHandler<Event> for Processor {
                     if window_context.dirty {
                         window_context.display.window.request_redraw();
                     }
+                }
+            },
+            (EventType::Terminal(TerminalEvent::Bell), Some(window_id)) => {
+                // Send desktop notification if window is not focused or tab is not active.
+                if self.config.bell.notification
+                    && let Some(wc) = self.windows.get(window_id)
+                {
+                    // Check window focus via the active terminal.
+                    let active_terminal = if let Some(tg) = &wc.tab_group {
+                        Arc::clone(&tg.active_tab().terminal)
+                    } else {
+                        Arc::clone(wc.terminal_arc())
+                    };
+                    let focused = active_terminal.lock().is_focused;
+
+                    // Check if the bell-firing tab is the currently active tab.
+                    let is_active_tab = match (&wc.tab_group, event.tab_id) {
+                        (Some(tg), Some(tid)) => tg.active_tab().tab_id == tid,
+                        _ => true,
+                    };
+
+                    if !focused || !is_active_tab {
+                        // Get the tab title for the notification body.
+                        let tab_title = if let Some(tg) = &wc.tab_group {
+                            event
+                                .tab_id
+                                .and_then(|tid| {
+                                    tg.tabs()
+                                        .iter()
+                                        .find(|t| t.tab_id == tid)
+                                        .map(|t| t.title.clone())
+                                })
+                                .unwrap_or_else(|| "Bell".to_owned())
+                        } else {
+                            wc.display.window.title().to_owned()
+                        };
+
+                        self.desktop_notifier.notify(
+                            *window_id,
+                            event.tab_id,
+                            "Alacritty",
+                            &tab_title,
+                        );
+                    }
+                }
+
+                // Always forward to window handler for visual bell + bell command.
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_event(
+                        #[cfg(target_os = "macos")]
+                        event_loop,
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(
+                            EventType::Terminal(TerminalEvent::Bell),
+                            *window_id,
+                        )),
+                    );
+                }
+            },
+            // Clear notifications when switching tabs.
+            (payload @ (EventType::SelectNextTab
+            | EventType::SelectPreviousTab
+            | EventType::SelectTab(_)
+            | EventType::SelectLastTab), Some(window_id)) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.handle_event(
+                        #[cfg(target_os = "macos")]
+                        event_loop,
+                        &self.proxy,
+                        &mut self.clipboard,
+                        &mut self.scheduler,
+                        WinitEvent::UserEvent(Event::new(payload, *window_id)),
+                    );
+                    // Clear notification for the newly active tab after switching.
+                    let active_tab_id =
+                        window_context.tab_group.as_ref().map(|tg| tg.active_tab().tab_id);
+                    self.desktop_notifier.clear(*window_id, active_tab_id);
+                }
+            },
+            // Handle notification click: focus window and switch to tab.
+            (EventType::FocusTab { window_id, tab_id }, _) => {
+                if let Some(wc) = self.windows.get_mut(&window_id) {
+                    wc.display.window.focus_window();
+                    if let Some(tab_id) = tab_id
+                        && let Some(ref tab_group) = wc.tab_group
+                        && let Some((idx, _)) = tab_group
+                            .tabs()
+                            .iter()
+                            .enumerate()
+                            .find(|(_, t)| t.tab_id == tab_id)
+                    {
+                        wc.select_tab(idx);
+                    }
+                    self.desktop_notifier.clear(window_id, tab_id);
                 }
             },
             (payload, Some(window_id)) => {
@@ -817,6 +939,8 @@ pub enum EventType {
         /// Window-relative cursor y at the time of release.
         cursor_y: i32,
     },
+    /// Focus a specific window and tab (triggered by notification click).
+    FocusTab { window_id: WindowId, tab_id: Option<usize> },
 }
 
 impl From<TerminalEvent> for EventType {
@@ -2282,7 +2406,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::MoveTabLeft
                 | EventType::MoveTabRight
                 | EventType::MoveTab { .. }
-                | EventType::TransferTab { .. } => (),
+                | EventType::TransferTab { .. }
+                | EventType::FocusTab { .. } => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
