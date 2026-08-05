@@ -21,7 +21,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
-use alacritty_terminal::event::Event as TerminalEvent;
+use alacritty_terminal::event::{Event as TerminalEvent, Notify};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
@@ -67,6 +67,7 @@ pub struct WindowContext {
 
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
+    deferred_keys: input::DeferredKeys,
     modifiers: Modifiers,
     inline_search_state: InlineSearchState,
     search_state: SearchState,
@@ -213,10 +214,12 @@ impl WindowContext {
         // Decompose the tab to avoid triggering Drop (PTY shutdown).
         let mut parts = tab.into_parts();
 
-        // Retarget the tab's EventProxy to this new window.
+        // Retarget the tab's EventProxy to this new window. The tab becomes the window's
+        // base terminal, which carries no tab id (it turns into tab 0 once a tab group
+        // is created), so events keep matching the window's active tab id.
         {
             let term = parts.terminal.lock();
-            term.event_proxy().retarget(display.window.id(), Some(parts.tab_id));
+            term.event_proxy().retarget(display.window.id(), None);
         }
 
         // Resize the tab's terminal to match this window's size.
@@ -235,6 +238,7 @@ impl WindowContext {
             event_proxy,
             tab_group: None,
             cursor_blink_timed_out: Default::default(),
+            deferred_keys: Default::default(),
             prev_bell_cmd: Default::default(),
             inline_search_state: Default::default(),
             message_buffer: Default::default(),
@@ -329,6 +333,7 @@ impl WindowContext {
             event_proxy,
             tab_group: None,
             cursor_blink_timed_out: Default::default(),
+            deferred_keys: Default::default(),
             prev_bell_cmd: Default::default(),
             inline_search_state: Default::default(),
             message_buffer: Default::default(),
@@ -369,6 +374,9 @@ impl WindowContext {
         // Resize the base terminal to account for the new tab bar.
         self.terminal.lock().resize(tab_size_info);
         let _ = self.notifier.0.send(Msg::Resize(tab_size_info.into()));
+
+        // Keys deferred before the tab group existed belong to the base terminal, now tab 0.
+        self.deferred_keys.assign_tab_id(0);
 
         TabGroup::new(initial_tab)
     }
@@ -849,6 +857,26 @@ impl WindowContext {
             }
         }
 
+        // Route PTY replies from background tabs to their own PTY; the queued path below
+        // only ever writes to the active tab's notifier.
+        if let WinitEvent::UserEvent(Event {
+            payload: EventType::Terminal(TerminalEvent::PtyWrite(text)),
+            tab_id,
+            ..
+        }) = &event
+            && let Some(tab_group) = &self.tab_group
+        {
+            // The initial tab's event proxy carries no tab id, but it is tab 0.
+            let source_tab_id = tab_id.unwrap_or(0);
+            if source_tab_id != tab_group.active_tab().tab_id {
+                if let Some(tab) = tab_group.tabs().iter().find(|tab| tab.tab_id == source_tab_id)
+                {
+                    tab.notifier.notify(text.clone().into_bytes());
+                }
+                return;
+            }
+        }
+
         match event {
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
@@ -867,6 +895,7 @@ impl WindowContext {
 
         // Get tab count before mutable borrows (for tab bar click detection).
         let tab_count = self.tab_group.as_ref().map_or(0, |tg| tg.tabs().len());
+        let active_tab_id = self.tab_group.as_ref().map(|tg| tg.active_tab().tab_id);
 
         // Get the active terminal and notifier (from tab group if present).
         #[cfg(not(windows))]
@@ -927,6 +956,8 @@ impl WindowContext {
             clipboard,
             scheduler,
             tab_count,
+            deferred_keys: &mut self.deferred_keys,
+            active_tab_id,
         };
         // Scope the processor to release borrows before submit_display_update.
         {

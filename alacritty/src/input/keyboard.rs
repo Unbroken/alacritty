@@ -17,6 +17,39 @@ use crate::event::TYPING_SEARCH_DELAY;
 use crate::input::{ActionContext, Execute, Processor};
 use crate::scheduler::{TimerId, Topic};
 
+/// First key code in the key handling extension's reserved Unicode Private Use Area block.
+const UNIVERSAL_NAMED_KEY_BASE: u32 = 0xf500;
+
+fn universal_named_key_code(named: NamedKey) -> Option<u32> {
+    let offset = match named {
+        NamedKey::Insert => 0,
+        NamedKey::Delete => 1,
+        NamedKey::ArrowLeft => 2,
+        NamedKey::ArrowRight => 3,
+        NamedKey::ArrowUp => 4,
+        NamedKey::ArrowDown => 5,
+        NamedKey::PageUp => 6,
+        NamedKey::PageDown => 7,
+        NamedKey::Home => 8,
+        NamedKey::End => 9,
+        NamedKey::F1 => 10,
+        NamedKey::F2 => 11,
+        NamedKey::F3 => 12,
+        NamedKey::F4 => 13,
+        NamedKey::F5 => 14,
+        NamedKey::F6 => 15,
+        NamedKey::F7 => 16,
+        NamedKey::F8 => 17,
+        NamedKey::F9 => 18,
+        NamedKey::F10 => 19,
+        NamedKey::F11 => 20,
+        NamedKey::F12 => 21,
+        _ => return None,
+    };
+
+    Some(UNIVERSAL_NAMED_KEY_BASE + offset)
+}
+
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Process key input.
     pub fn key_input(&mut self, key: KeyEvent) {
@@ -75,13 +108,23 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         // Mask `Alt` modifier from input when we won't send esc.
-        let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
+        //
+        // Universal key reporting always includes the real modifier state: Option acts as Alt at
+        // the protocol level regardless of `option_as_alt`, with the composed character still
+        // delivered through the associated text.
+        let report_all =
+            mode.intersects(TermMode::REPORT_ALL_KEYS_AS_ESC | TermMode::REPORT_KEY_EVENT_HANDLING);
+        let mods = if report_all || self.alt_send_esc(&key, text) {
+            mods
+        } else {
+            mods & !ModifiersState::ALT
+        };
 
         let build_key_sequence = Self::should_build_sequence(&key, text, mode, mods);
         let is_modifier_key = Self::is_modifier_key(&key);
 
         let bytes = if build_key_sequence {
-            build_sequence(key, mods, mode)
+            build_sequence(key, mods, mode, None)
         } else {
             let mut bytes = Vec::with_capacity(text.len() + 1);
             if mods.alt_key() {
@@ -147,7 +190,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         mode: TermMode,
         mods: ModifiersState,
     ) -> bool {
-        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        if mode.intersects(TermMode::REPORT_ALL_KEYS_AS_ESC | TermMode::REPORT_KEY_EVENT_HANDLING) {
             return true;
         }
 
@@ -178,6 +221,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     fn process_key_bindings(&mut self, key: &KeyEvent) -> bool {
         let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
         let mods = self.ctx.modifiers().state();
+        let defer_enabled =
+            self.ctx.terminal().mode().contains(TermMode::REPORT_KEY_EVENT_HANDLING);
 
         // Don't suppress char if no bindings were triggered.
         let mut suppress_chars = None;
@@ -225,9 +270,24 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         };
 
         // Trigger matching key bindings.
+        let mut deferred_actions = Vec::new();
+        let mut deferred_passthrough = false;
         for i in 0..self.ctx.config().key_bindings().len() {
             let binding = &self.ctx.config().key_bindings()[i];
             if let Some(action) = binding_action(binding) {
+                if let Action::Deferred(deferred_action) = &action {
+                    if defer_enabled {
+                        deferred_actions.push((**deferred_action).clone());
+                    } else {
+                        // Without handling reports the wrapped action runs directly, in binding
+                        // order.
+                        deferred_passthrough |= **deferred_action == Action::ReceiveChar;
+                        deferred_action.execute(&mut self.ctx);
+                    }
+
+                    continue;
+                }
+
                 action.execute(&mut self.ctx);
             }
         }
@@ -245,7 +305,31 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
         }
 
+        // Restore the pass-through the `Deferred` wrapper suppressed above when a deferred
+        // `ReceiveChar` ran directly.
+        if deferred_passthrough {
+            suppress_chars = Some(false);
+        }
+
+        if !deferred_actions.is_empty() {
+            self.defer_key_bindings(key, deferred_actions);
+
+            // The forwarded event already carries the key, so suppress the normal input path
+            // even when another binding is `ReceiveChar`.
+            suppress_chars = Some(true);
+        }
+
         suppress_chars.unwrap_or(false)
+    }
+
+    /// Forward a key with matching deferred bindings to the application, tagged with a report
+    /// id, so the binding actions can run once the application reports the key as unhandled.
+    fn defer_key_bindings(&mut self, key: &KeyEvent, actions: Vec<Action>) {
+        let mode = *self.ctx.terminal().mode();
+        let id = self.ctx.deferred_key_id();
+        let mods = self.ctx.modifiers().state();
+        let bytes = build_sequence(key.clone(), mods, mode, Some(id));
+        self.ctx.defer_key_actions(id, actions, bytes.into());
     }
 
     /// Handle key release.
@@ -258,19 +342,26 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return;
         }
 
-        // Mask `Alt` modifier from input when we won't send esc.
+        // Mask `Alt` modifier from legacy input when we won't send esc.
         let text = key.text_with_all_modifiers().unwrap_or_default();
-        let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
+        let universal = mode.contains(TermMode::REPORT_KEY_EVENT_HANDLING);
+        let mods = if universal || self.alt_send_esc(&key, text) {
+            mods
+        } else {
+            mods & !ModifiersState::ALT
+        };
 
         let bytes = match key.logical_key.as_ref() {
             Key::Named(NamedKey::Enter)
             | Key::Named(NamedKey::Tab)
             | Key::Named(NamedKey::Backspace)
-                if !mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) =>
+                if !mode.intersects(
+                    TermMode::REPORT_ALL_KEYS_AS_ESC | TermMode::REPORT_KEY_EVENT_HANDLING,
+                ) =>
             {
                 return;
             },
-            _ => build_sequence(key, mods, mode),
+            _ => build_sequence(key, mods, mode, None),
         };
 
         self.ctx.write_to_pty(bytes);
@@ -292,25 +383,38 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 ///
 /// The key sequences for `APP_KEYPAD` and alike are handled inside the bindings.
 #[inline(never)]
-fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8> {
+fn build_sequence(
+    key: KeyEvent,
+    mods: ModifiersState,
+    mode: TermMode,
+    report_id: Option<u16>,
+) -> Vec<u8> {
     let mut modifiers = mods.into();
+    let universal = mode.contains(TermMode::REPORT_KEY_EVENT_HANDLING);
 
-    let kitty_seq = mode.intersects(
-        TermMode::REPORT_ALL_KEYS_AS_ESC
-            | TermMode::DISAMBIGUATE_ESC_CODES
-            | TermMode::REPORT_EVENT_TYPES,
-    );
+    let kitty_seq = universal
+        || mode.intersects(
+            TermMode::REPORT_ALL_KEYS_AS_ESC
+                | TermMode::DISAMBIGUATE_ESC_CODES
+                | TermMode::REPORT_EVENT_TYPES,
+        );
 
-    let kitty_encode_all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let kitty_encode_all = universal || mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
     // The default parameter is 1, so we can omit it.
     let kitty_event_type = mode.contains(TermMode::REPORT_EVENT_TYPES)
         && (key.repeat || key.state == ElementState::Released);
 
-    let context =
-        SequenceBuilder { mode, modifiers, kitty_seq, kitty_encode_all, kitty_event_type };
+    let context = SequenceBuilder {
+        mode,
+        modifiers,
+        kitty_seq,
+        kitty_encode_all,
+        kitty_event_type,
+        universal,
+    };
 
     let associated_text = key.text_with_all_modifiers().filter(|text| {
-        mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)
+        (universal || mode.contains(TermMode::REPORT_ASSOCIATED_TEXT))
             && key.state != ElementState::Released
             && !text.is_empty()
             && !is_control_character(text)
@@ -318,31 +422,56 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
 
     let sequence_base = context
         .try_build_numpad(&key)
+        .or_else(|| context.try_build_named_universal(&key))
         .or_else(|| context.try_build_named_kitty(&key))
-        .or_else(|| context.try_build_named_normal(&key, associated_text.is_some()))
+        .or_else(|| {
+            if universal {
+                None
+            } else {
+                context.try_build_named_normal(&key, associated_text.is_some())
+            }
+        })
         .or_else(|| context.try_build_control_char_or_mod(&key, &mut modifiers))
-        .or_else(|| context.try_build_textual(&key, associated_text));
+        .or_else(|| context.try_build_textual(&key, associated_text))
+        .or_else(|| universal.then(|| SequenceBase::new("0".into(), SequenceTerminator::Kitty)));
 
-    let (payload, terminator) = match sequence_base {
-        Some(SequenceBase { payload, terminator }) => (payload, terminator),
+    let sequence_base = match sequence_base {
+        Some(sequence_base) => sequence_base,
         _ => return Vec::new(),
     };
 
-    let mut payload = format!("\x1b[{payload}");
+    let event_type = kitty_event_type.then_some(match key.state {
+        _ if key.repeat => '2',
+        ElementState::Pressed => '1',
+        ElementState::Released => '3',
+    });
 
-    // Add modifiers information.
-    if kitty_event_type || !modifiers.is_empty() || associated_text.is_some() {
+    encode_key_sequence(sequence_base, modifiers, event_type, associated_text, report_id)
+}
+
+fn encode_key_sequence(
+    sequence_base: SequenceBase,
+    modifiers: SequenceModifiers,
+    event_type: Option<char>,
+    associated_text: Option<&str>,
+    report_id: Option<u16>,
+) -> Vec<u8> {
+    debug_assert!(report_id.is_none() || sequence_base.terminator == SequenceTerminator::Kitty);
+
+    let mut payload = format!("\x1b[{}", sequence_base.payload);
+
+    // A deferred report id occupies the fourth parameter, so its preceding fields must exist.
+    if report_id.is_some()
+        || event_type.is_some()
+        || !modifiers.is_empty()
+        || associated_text.is_some()
+    {
         payload.push_str(&format!(";{}", modifiers.encode_esc_sequence()));
     }
 
     // Push event type.
-    if kitty_event_type {
+    if let Some(event_type) = event_type {
         payload.push(':');
-        let event_type = match key.state {
-            _ if key.repeat => '2',
-            ElementState::Pressed => '1',
-            ElementState::Released => '3',
-        };
         payload.push(event_type);
     }
 
@@ -356,7 +485,15 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
         }
     }
 
-    payload.push(terminator.encode_esc_sequence());
+    if let Some(report_id) = report_id {
+        debug_assert_ne!(report_id, 0);
+        if associated_text.is_none() {
+            payload.push(';');
+        }
+        payload.push_str(&format!(";{report_id}"));
+    }
+
+    payload.push(sequence_base.terminator.encode_esc_sequence());
 
     payload.into_bytes()
 }
@@ -370,6 +507,8 @@ pub struct SequenceBuilder {
     kitty_encode_all: bool,
     /// Report event types.
     kitty_event_type: bool,
+    /// Encode every physical key using the key handling extension's CSI-u form.
+    universal: bool,
     modifiers: SequenceModifiers,
 }
 
@@ -394,19 +533,25 @@ impl SequenceBuilder {
             let alternate_key_code = u32::from(ch);
             let mut unicode_key_code = u32::from(unshifted_ch);
 
-            // Try to get the base for keys which change based on modifier, like `1` for `!`.
-            //
-            // However it should only be performed when `SHIFT` is pressed.
-            if shift
-                && alternate_key_code == unicode_key_code
+            // The protocol key code is the key with all modifiers ignored: `1` for `!`, and the
+            // physical layout key for characters composed through modifiers (macOS Option), whose
+            // composed character travels in the associated text instead.
+            if alternate_key_code == unicode_key_code
                 && let Key::Character(unmodded) = key.key_without_modifiers().as_ref()
+                && let Some(unmodded_ch) = unmodded.chars().next()
             {
-                unicode_key_code = u32::from(unmodded.chars().next().unwrap_or(unshifted_ch));
+                let unmodded_ch = unmodded_ch.to_lowercase().next().unwrap_or(unmodded_ch);
+                unicode_key_code = u32::from(unmodded_ch);
             }
 
             // NOTE: Base layouts are ignored, since winit doesn't expose this information
             // yet.
+            //
+            // The alternate field is the shifted key, so it is only reported under Shift; a
+            // character composed through other modifiers reaches the application as associated
+            // text instead.
             let payload = if self.mode.contains(TermMode::REPORT_ALTERNATE_KEYS)
+                && shift
                 && alternate_key_code != unicode_key_code
             {
                 format!("{unicode_key_code}:{alternate_key_code}")
@@ -422,6 +567,25 @@ impl SequenceBuilder {
         } else {
             None
         }
+    }
+
+    /// Encode keys whose canonical kitty representation uses a legacy functional-key sequence.
+    ///
+    /// The handling-report extension reserves U+F500 through U+F515 in Unicode's BMP Private Use
+    /// Area. This is kept away from kitty's currently assigned functional-key block. The ordering
+    /// is part of the protocol and must remain stable.
+    fn try_build_named_universal(&self, key: &KeyEvent) -> Option<SequenceBase> {
+        if !self.universal {
+            return None;
+        }
+
+        let named = match key.logical_key {
+            Key::Named(named) => named,
+            _ => return None,
+        };
+
+        let code = universal_named_key_code(named)?;
+        Some(SequenceBase::new(code.to_string().into(), SequenceTerminator::Kitty))
     }
 
     /// Try building from numpad key.
@@ -716,4 +880,43 @@ fn is_control_character(text: &str) -> bool {
     // does not match the reported text (`^H`), despite not technically being part of C0 or C1.
     let codepoint = text.bytes().next().unwrap();
     text.len() == 1 && (codepoint < 0x20 || (0x7f..=0x9f).contains(&codepoint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn universal_named_key_codes_are_stable() {
+        assert_eq!(universal_named_key_code(NamedKey::Insert), Some(0xf500));
+        assert_eq!(universal_named_key_code(NamedKey::ArrowLeft), Some(0xf502));
+        assert_eq!(universal_named_key_code(NamedKey::PageUp), Some(0xf506));
+        assert_eq!(universal_named_key_code(NamedKey::End), Some(0xf509));
+        assert_eq!(universal_named_key_code(NamedKey::F1), Some(0xf50a));
+        assert_eq!(universal_named_key_code(NamedKey::F12), Some(0xf515));
+        assert_eq!(universal_named_key_code(NamedKey::Enter), None);
+    }
+
+    #[test]
+    fn universal_sequence_has_optional_report_field() {
+        let page_up = SequenceBase::new("62726".into(), SequenceTerminator::Kitty);
+        let bytes = encode_key_sequence(page_up, SequenceModifiers::ALT, None, None, Some(42));
+        assert_eq!(bytes, b"\x1b[62726;3;;42u");
+
+        let page_up = SequenceBase::new("62726".into(), SequenceTerminator::Kitty);
+        let bytes = encode_key_sequence(page_up, SequenceModifiers::ALT, None, None, None);
+        assert_eq!(bytes, b"\x1b[62726;3u");
+
+        let character = SequenceBase::new("97".into(), SequenceTerminator::Kitty);
+        let bytes =
+            encode_key_sequence(character, SequenceModifiers::empty(), None, Some("a"), None);
+        assert_eq!(bytes, b"\x1b[97;1;97u");
+    }
+
+    #[test]
+    fn legacy_sequence_format_is_unchanged_without_report_id() {
+        let page_up = SequenceBase::new("5".into(), SequenceTerminator::Normal('~'));
+        let bytes = encode_key_sequence(page_up, SequenceModifiers::empty(), None, None, None);
+        assert_eq!(bytes, b"\x1b[5~");
+    }
 }

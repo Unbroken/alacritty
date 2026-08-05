@@ -77,12 +77,14 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        const REPORT_KEY_EVENT_HANDLING = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
                                       | Self::REPORT_ALTERNATE_KEYS.bits()
                                       | Self::REPORT_ALL_KEYS_AS_ESC.bits()
-                                      | Self::REPORT_ASSOCIATED_TEXT.bits();
+                                      | Self::REPORT_ASSOCIATED_TEXT.bits()
+                                      | Self::REPORT_KEY_EVENT_HANDLING.bits();
          const ANY                    = u32::MAX;
     }
 }
@@ -105,6 +107,9 @@ impl From<KeyboardModes> for TermMode {
 
         let report_associated_text = value.contains(KeyboardModes::REPORT_ASSOCIATED_TEXT);
         mode.set(TermMode::REPORT_ASSOCIATED_TEXT, report_associated_text);
+
+        let report_key_event_handling = value.contains(KeyboardModes::REPORT_KEY_EVENT_HANDLING);
+        mode.set(TermMode::REPORT_KEY_EVENT_HANDLING, report_key_event_handling);
 
         mode
     }
@@ -1293,6 +1298,12 @@ impl<T: EventListener> Handler for Term<T> {
             self.keyboard_mode_stack.last().unwrap_or(&KeyboardModes::NO_MODE).bits();
         let text = format!("\x1b[?{current_mode}u");
         self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+
+    #[inline]
+    fn report_key_event_handled(&mut self, id: u16, handled: bool) {
+        trace!("Application reported key event {id} as handled: {handled}");
+        self.event_proxy.send_event(Event::KeyEventHandled(id, handled));
     }
 
     #[inline]
@@ -2528,6 +2539,21 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn report_key_event_handling_keyboard_mode() {
+        let size = TermSize::new(10, 10);
+        let config = Config { kitty_keyboard: true, ..Default::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"\x1b[>128u");
+        assert!(term.mode().contains(TermMode::REPORT_KEY_EVENT_HANDLING));
+        assert!(TermMode::KITTY_KEYBOARD_PROTOCOL.contains(TermMode::REPORT_KEY_EVENT_HANDLING));
+
+        parser.advance(&mut term, b"\x1b[<1u");
+        assert!(!term.mode().contains(TermMode::REPORT_KEY_EVENT_HANDLING));
+    }
 
     #[test]
     fn scroll_display_page_up() {

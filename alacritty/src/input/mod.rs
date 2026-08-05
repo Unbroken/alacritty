@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cmp::{Ordering, max, min};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -77,13 +77,189 @@ const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 ///
 /// An escape sequence may be emitted in case specific keys or key combinations
 /// are activated.
+/// How long a deferred key binding waits for the application's handling report before running
+/// its action anyway.
+pub const KEY_HANDLING_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Key bindings awaiting the application's report on whether the key event was handled.
+pub struct DeferredKey {
+    pub id: u16,
+    pub actions: Vec<Action>,
+    pub tab_id: Option<usize>,
+    pub deadline: Instant,
+}
+
+enum DeferredInput {
+    Bytes(Cow<'static, [u8]>),
+    Key { id: u16, actions: Vec<Action>, bytes: Cow<'static, [u8]> },
+}
+
+struct DeferredStream {
+    tab_id: Option<usize>,
+    active: Option<DeferredKey>,
+    queued: VecDeque<DeferredInput>,
+    resolving: bool,
+}
+
+/// Deferred key bindings and later input waiting for their application replies.
+#[derive(Default)]
+pub struct DeferredKeys {
+    next_id: u16,
+    streams: Vec<DeferredStream>,
+}
+
+impl DeferredKeys {
+    /// Reserve a nonzero report id for a deferred key event.
+    pub fn next_id(&mut self) -> u16 {
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+
+        self.next_id
+    }
+
+    /// Queue a deferred key, returning its bytes when it can be forwarded immediately.
+    pub fn push(
+        &mut self,
+        id: u16,
+        actions: Vec<Action>,
+        tab_id: Option<usize>,
+        bytes: Cow<'static, [u8]>,
+    ) -> Option<Cow<'static, [u8]>> {
+        if let Some(stream) = self.stream_mut(tab_id) {
+            stream.queued.push_back(DeferredInput::Key { id, actions, bytes });
+            return None;
+        }
+
+        let deadline = Instant::now() + KEY_HANDLING_TIMEOUT;
+        let active = DeferredKey { id, actions, tab_id, deadline };
+        self.streams.push(DeferredStream {
+            tab_id,
+            active: Some(active),
+            queued: VecDeque::new(),
+            resolving: false,
+        });
+
+        Some(bytes)
+    }
+
+    /// Queue ordinary PTY input behind an unresolved deferred key for the same tab.
+    pub fn write_or_queue(
+        &mut self,
+        tab_id: Option<usize>,
+        bytes: Cow<'static, [u8]>,
+    ) -> Option<Cow<'static, [u8]>> {
+        let Some(stream) = self.stream_mut(tab_id) else {
+            return Some(bytes);
+        };
+
+        // Fallback actions execute while the stream is resolving and must precede queued input.
+        if stream.resolving {
+            Some(bytes)
+        } else {
+            stream.queued.push_back(DeferredInput::Bytes(bytes));
+            None
+        }
+    }
+
+    /// Start resolving the active entry for a report id from the reporting tab.
+    pub fn take(&mut self, id: u16, tab_id: Option<usize>) -> Option<DeferredKey> {
+        let stream = self.stream_mut(tab_id)?;
+        if stream.active.as_ref()?.id != id {
+            return None;
+        }
+
+        stream.resolving = true;
+        stream.active.take()
+    }
+
+    /// Reassign entries recorded for the base terminal once it becomes a tab.
+    pub fn assign_tab_id(&mut self, tab_id: usize) {
+        for stream in &mut self.streams {
+            if stream.tab_id.is_none() {
+                stream.tab_id = Some(tab_id);
+                if let Some(active) = &mut stream.active {
+                    active.tab_id = Some(tab_id);
+                }
+            }
+        }
+    }
+
+    /// Start resolving the oldest active entry whose deadline has passed.
+    pub fn pop_expired(&mut self, now: Instant) -> Option<DeferredKey> {
+        let index = self
+            .streams
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stream)| Some((index, stream.active.as_ref()?.deadline)))
+            .filter(|(_, deadline)| *deadline <= now)
+            .min_by_key(|(_, deadline)| *deadline)?
+            .0;
+
+        let stream = &mut self.streams[index];
+        stream.resolving = true;
+        stream.active.take()
+    }
+
+    /// Resume a tab's input stream until the next deferred key needs an application reply.
+    pub fn resume(
+        &mut self,
+        tab_id: Option<usize>,
+        now: Instant,
+    ) -> Vec<Cow<'static, [u8]>> {
+        let Some(index) = self.streams.iter().position(|stream| stream.tab_id == tab_id) else {
+            return Vec::new();
+        };
+
+        let stream = &mut self.streams[index];
+        stream.resolving = false;
+        let mut writes = Vec::new();
+
+        while let Some(input) = stream.queued.pop_front() {
+            match input {
+                DeferredInput::Bytes(bytes) => writes.push(bytes),
+                DeferredInput::Key { id, actions, bytes } => {
+                    let deadline = now + KEY_HANDLING_TIMEOUT;
+                    stream.active = Some(DeferredKey { id, actions, tab_id, deadline });
+                    writes.push(bytes);
+                    break;
+                },
+            }
+        }
+
+        if stream.active.is_none() && stream.queued.is_empty() {
+            self.streams.remove(index);
+        }
+
+        writes
+    }
+
+    /// Drop all pending actions and queued input for a tab that cannot safely be targeted.
+    pub fn discard(&mut self, tab_id: Option<usize>) {
+        self.streams.retain(|stream| stream.tab_id != tab_id);
+    }
+
+    /// Deadline of the oldest active entry.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.streams
+            .iter()
+            .filter_map(|stream| stream.active.as_ref().map(|key| key.deadline))
+            .min()
+    }
+
+    fn stream_mut(&mut self, tab_id: Option<usize>) -> Option<&mut DeferredStream> {
+        self.streams.iter_mut().find(|stream| stream.tab_id == tab_id)
+    }
+}
+
 pub struct Processor<T: EventListener, A: ActionContext<T>> {
     pub ctx: A,
     _phantom: PhantomData<T>,
 }
 
 pub trait ActionContext<T: EventListener> {
-    fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, _data: B) {}
+    fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&mut self, _data: B) {}
     fn mark_dirty(&mut self) {}
     fn size_info(&self) -> SizeInfo;
     fn copy_selection(&mut self, _ty: ClipboardType) {}
@@ -182,6 +358,20 @@ pub trait ActionContext<T: EventListener> {
 
     /// Transfer a tab to another window or a new window at the given cursor position.
     fn transfer_tab(&mut self, _tab_index: usize, _cursor_x: i32, _cursor_y: i32) {}
+
+    /// Reserve a report id for a deferred key event.
+    fn deferred_key_id(&mut self) -> u16 {
+        0
+    }
+
+    /// Forward or queue a deferred key event while preserving input order.
+    fn defer_key_actions(
+        &mut self,
+        _id: u16,
+        _actions: Vec<Action>,
+        _input: Cow<'static, [u8]>,
+    ) {
+    }
 }
 
 impl Action {
@@ -199,7 +389,7 @@ impl Action {
     }
 }
 
-trait Execute<T: EventListener> {
+pub trait Execute<T: EventListener> {
     fn execute<A: ActionContext<T>>(&self, ctx: &mut A);
 }
 
@@ -209,6 +399,8 @@ impl<T: EventListener> Execute<T> for Action {
         match self {
             Action::Esc(s) => ctx.paste(s, false),
             Action::Command(program) => ctx.spawn_daemon(program.program(), program.args()),
+            // Executed directly when key event handling reports are inactive.
+            Action::Deferred(action) => action.execute(ctx),
             Action::Hint(hint) => {
                 ctx.display().hint_state.start(hint.clone());
                 ctx.mark_dirty();
@@ -1343,6 +1535,49 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_keys_preserve_input_order() {
+        let mut deferred = DeferredKeys::default();
+        let first_id = deferred.next_id();
+        let first = Cow::Borrowed(&b"first"[..]);
+        assert_eq!(deferred.push(first_id, vec![], None, first.clone()), Some(first));
+
+        assert_eq!(deferred.write_or_queue(None, Cow::Borrowed(&b"a"[..])), None);
+
+        let second_id = deferred.next_id();
+        let second = Cow::Borrowed(&b"second"[..]);
+        assert_eq!(deferred.push(second_id, vec![], None, second.clone()), None);
+        assert_eq!(deferred.write_or_queue(None, Cow::Borrowed(&b"b"[..])), None);
+
+        // A queued deferred key cannot resolve before its bytes have been forwarded.
+        assert!(deferred.take(second_id, None).is_none());
+        assert_eq!(deferred.take(first_id, None).unwrap().id, first_id);
+
+        // The first fallback bypasses the barrier, then input resumes only through the second key.
+        let fallback = Cow::Borrowed(&b"fallback"[..]);
+        assert_eq!(deferred.write_or_queue(None, fallback.clone()), Some(fallback));
+        assert_eq!(
+            deferred.resume(None, Instant::now()),
+            vec![Cow::Borrowed(&b"a"[..]), second]
+        );
+
+        assert_eq!(deferred.take(second_id, None).unwrap().id, second_id);
+        assert_eq!(deferred.resume(None, Instant::now()), vec![Cow::Borrowed(&b"b"[..])]);
+        assert!(deferred.next_deadline().is_none());
+    }
+
+    #[test]
+    fn deferred_keys_only_block_their_own_tab() {
+        let mut deferred = DeferredKeys::default();
+        let id = deferred.next_id();
+        let key = Cow::Borrowed(&b"key"[..]);
+        assert_eq!(deferred.push(id, vec![], Some(0), key.clone()), Some(key));
+
+        let other_tab = Cow::Borrowed(&b"other"[..]);
+        assert_eq!(deferred.write_or_queue(Some(1), other_tab.clone()), Some(other_tab));
+        assert_eq!(deferred.write_or_queue(Some(0), Cow::Borrowed(&b"same"[..])), None);
+    }
 
     use winit::event::{DeviceId, Event as WinitEvent, WindowEvent};
     use winit::keyboard::Key;
