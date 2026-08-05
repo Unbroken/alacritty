@@ -115,6 +115,11 @@ pub enum Action {
     #[config(skip)]
     Mouse(MouseAction),
 
+    /// Run the wrapped action only when the application reports the forwarded key event as
+    /// unhandled (or does not answer in time). Configured with `defer = true` on a key binding.
+    #[config(skip)]
+    Deferred(Box<Action>),
+
     /// Paste contents of system clipboard.
     Paste,
 
@@ -969,7 +974,8 @@ impl<'a> Deserialize<'a> for RawBinding {
     where
         D: Deserializer<'a>,
     {
-        const FIELDS: &[&str] = &["key", "mods", "mode", "action", "chars", "mouse", "command"];
+        const FIELDS: &[&str] =
+            &["key", "mods", "mode", "action", "chars", "mouse", "command", "defer"];
 
         enum Field {
             Key,
@@ -979,6 +985,7 @@ impl<'a> Deserialize<'a> for RawBinding {
             Chars,
             Mouse,
             Command,
+            Defer,
         }
 
         impl<'a> Deserialize<'a> for Field {
@@ -1007,6 +1014,7 @@ impl<'a> Deserialize<'a> for RawBinding {
                             "chars" => Ok(Field::Chars),
                             "mouse" => Ok(Field::Mouse),
                             "command" => Ok(Field::Command),
+                            "defer" => Ok(Field::Defer),
                             _ => Err(E::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1036,6 +1044,7 @@ impl<'a> Deserialize<'a> for RawBinding {
                 let mut not_mode: Option<BindingMode> = None;
                 let mut mouse: Option<MouseEvent> = None;
                 let mut command: Option<Program> = None;
+                let mut defer: Option<bool> = None;
 
                 use de::Error;
 
@@ -1138,6 +1147,13 @@ impl<'a> Deserialize<'a> for RawBinding {
 
                             command = Some(map.next_value::<Program>()?);
                         },
+                        Field::Defer => {
+                            if defer.is_some() {
+                                return Err(<V::Error as Error>::duplicate_field("defer"));
+                            }
+
+                            defer = Some(map.next_value::<bool>()?);
+                        },
                     }
                 }
 
@@ -1165,6 +1181,16 @@ impl<'a> Deserialize<'a> for RawBinding {
                             "must specify exactly one of chars, action or command",
                         ));
                     },
+                };
+
+                let action = if defer.unwrap_or(false) {
+                    if key.is_none() {
+                        return Err(V::Error::custom("defer is only available for key bindings"));
+                    }
+
+                    Action::Deferred(Box::new(action))
+                } else {
+                    action
                 };
 
                 if mouse.is_none() && key.is_none() {
@@ -1285,6 +1311,20 @@ mod tests {
                 trigger: Default::default(),
             }
         }
+    }
+
+    #[test]
+    fn deferred_binding_wraps_action() {
+        let binding: KeyBinding =
+            toml::from_str("key = \"C\"\nmods = \"Command\"\naction = \"Copy\"\ndefer = true")
+                .unwrap();
+
+        assert_eq!(binding.action, Action::Deferred(Box::new(Action::Copy)));
+
+        let binding: KeyBinding =
+            toml::from_str("key = \"C\"\nmods = \"Command\"\naction = \"Copy\"").unwrap();
+
+        assert_eq!(binding.action, Action::Copy);
     }
 
     #[test]

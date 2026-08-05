@@ -23,4 +23,6 @@ toml_edit = "0.24.0"
 # TODO: Validation of fix for #6978. Remove before next release and use released `x11-clipboard`.
 [patch.crates-io]
 crossfont = { git = "https://github.com/Unbroken/crossfont.git", rev = "e1cfb0b43b6502822a29a98eb2482193bbff9df1" }
+# Fork with the key event handling report extension (CSI ? id ; handled u).
+vte = { git = "https://github.com/Unbroken/vte.git", rev = "924970fd289b4ef401d0a7558a10bd1d22030545" }
 x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "19ab2163cf0bd0db607e827a5214571990307866" }

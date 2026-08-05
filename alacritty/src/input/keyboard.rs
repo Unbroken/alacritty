@@ -225,9 +225,28 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         };
 
         // Trigger matching key bindings.
+        let mut deferred_actions = Vec::new();
+        let mut deferred_bytes = None;
+        let mut deferred_passthrough = false;
         for i in 0..self.ctx.config().key_bindings().len() {
             let binding = &self.ctx.config().key_bindings()[i];
             if let Some(action) = binding_action(binding) {
+                if let Action::Deferred(deferred_action) = &action {
+                    // Whether the key can carry a report id is a property of the key alone;
+                    // computed once so all deferred actions share one forwarded key event.
+                    let deferrable =
+                        deferred_bytes.get_or_insert_with(|| self.deferred_key_bytes(key));
+                    if deferrable.is_some() {
+                        deferred_actions.push((**deferred_action).clone());
+                    } else {
+                        // Without a report the wrapped action runs directly, in binding order.
+                        deferred_passthrough |= **deferred_action == Action::ReceiveChar;
+                        deferred_action.execute(&mut self.ctx);
+                    }
+
+                    continue;
+                }
+
                 action.execute(&mut self.ctx);
             }
         }
@@ -245,7 +264,65 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
         }
 
+        // Restore the pass-through the `Deferred` wrapper suppressed above when a deferred
+        // `ReceiveChar` ran directly.
+        if deferred_passthrough {
+            suppress_chars = Some(false);
+        }
+
+        if !deferred_actions.is_empty()
+            && let Some(Some(bytes)) = deferred_bytes
+        {
+            self.defer_key_bindings(bytes, deferred_actions);
+
+            // The forwarded event already carries the key, so suppress the normal input path
+            // even when another binding is `ReceiveChar`.
+            suppress_chars = Some(true);
+        }
+
         suppress_chars.unwrap_or(false)
+    }
+
+    /// Encode a key for forwarding to the application with a report id parameter.
+    ///
+    /// Returns `None` when key event handling reports are inactive or the key has no kitty
+    /// escape sequence to carry the id, in which case deferred bindings run directly.
+    fn deferred_key_bytes(&mut self, key: &KeyEvent) -> Option<Vec<u8>> {
+        let mode = *self.ctx.terminal().mode();
+
+        if !mode.contains(TermMode::REPORT_KEY_EVENT_HANDLING) {
+            return None;
+        }
+
+        // Mask `Alt` exactly like the direct input path so the encoding matches.
+        let mods = self.ctx.modifiers().state();
+        let text = key.text_with_all_modifiers().unwrap_or_default();
+        let mods = if self.alt_send_esc(key, text) { mods } else { mods & !ModifiersState::ALT };
+
+        let bytes = build_sequence(key.clone(), mods, mode);
+
+        // Only kitty CSI u sequences can carry the report id parameter.
+        if bytes.len() < 4 || !bytes.starts_with(b"\x1b[") || bytes[bytes.len() - 1] != b'u' {
+            return None;
+        }
+
+        Some(bytes)
+    }
+
+    /// Forward a key with matching deferred bindings to the application, tagged with a report
+    /// id, so the binding actions can run once the application reports the key as unhandled.
+    fn defer_key_bindings(&mut self, mut bytes: Vec<u8>, actions: Vec<Action>) {
+        let id = self.ctx.defer_key_actions(actions);
+
+        // The id is the fourth parameter: key code, modifiers, associated text, report id.
+        let params = bytes[2..bytes.len() - 1].iter().filter(|&&byte| byte == b';').count() + 1;
+        bytes.truncate(bytes.len() - 1);
+        for _ in params..3 {
+            bytes.push(b';');
+        }
+        bytes.extend_from_slice(format!(";{id}u").as_bytes());
+
+        self.ctx.write_to_pty(bytes);
     }
 
     /// Handle key release.

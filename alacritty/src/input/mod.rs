@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cmp::{Ordering, max, min};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -77,6 +77,65 @@ const CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 ///
 /// An escape sequence may be emitted in case specific keys or key combinations
 /// are activated.
+/// How long a deferred key binding waits for the application's handling report before running
+/// its action anyway.
+pub const KEY_HANDLING_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Key bindings awaiting the application's report on whether the key event was handled.
+pub struct DeferredKey {
+    pub id: u16,
+    pub actions: Vec<Action>,
+    pub tab_id: Option<usize>,
+    pub deadline: Instant,
+}
+
+/// Deferred key bindings pending an application reply.
+#[derive(Default)]
+pub struct DeferredKeys {
+    next_id: u16,
+    pending: VecDeque<DeferredKey>,
+}
+
+impl DeferredKeys {
+    /// Queue the actions for one key event, returning the report id for the forwarded event.
+    pub fn push(&mut self, actions: Vec<Action>, tab_id: Option<usize>) -> u16 {
+        // Skip 0 so ids stay distinguishable from defaulted parameters.
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+
+        let id = self.next_id;
+        let deadline = Instant::now() + KEY_HANDLING_TIMEOUT;
+        self.pending.push_back(DeferredKey { id, actions, tab_id, deadline });
+
+        id
+    }
+
+    /// Remove the entry for a report id, if it was forwarded to the reporting tab.
+    pub fn take(&mut self, id: u16, tab_id: Option<usize>) -> Option<DeferredKey> {
+        let index = self.pending.iter().position(|key| key.id == id && key.tab_id == tab_id)?;
+        self.pending.remove(index)
+    }
+
+    /// Reassign entries recorded for the base terminal once it becomes a tab.
+    pub fn assign_tab_id(&mut self, tab_id: usize) {
+        for key in &mut self.pending {
+            key.tab_id.get_or_insert(tab_id);
+        }
+    }
+
+    /// Remove the oldest entry whose deadline has passed.
+    pub fn pop_expired(&mut self, now: Instant) -> Option<DeferredKey> {
+        if self.pending.front()?.deadline <= now { self.pending.pop_front() } else { None }
+    }
+
+    /// Deadline of the oldest pending entry.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.pending.front().map(|key| key.deadline)
+    }
+}
+
 pub struct Processor<T: EventListener, A: ActionContext<T>> {
     pub ctx: A,
     _phantom: PhantomData<T>,
@@ -182,6 +241,12 @@ pub trait ActionContext<T: EventListener> {
 
     /// Transfer a tab to another window or a new window at the given cursor position.
     fn transfer_tab(&mut self, _tab_index: usize, _cursor_x: i32, _cursor_y: i32) {}
+
+    /// Queue deferred key bindings awaiting the application's handling report; returns the
+    /// report id to attach to the forwarded key event.
+    fn defer_key_actions(&mut self, _actions: Vec<Action>) -> u16 {
+        0
+    }
 }
 
 impl Action {
@@ -199,7 +264,7 @@ impl Action {
     }
 }
 
-trait Execute<T: EventListener> {
+pub trait Execute<T: EventListener> {
     fn execute<A: ActionContext<T>>(&self, ctx: &mut A);
 }
 
@@ -209,6 +274,8 @@ impl<T: EventListener> Execute<T> for Action {
         match self {
             Action::Esc(s) => ctx.paste(s, false),
             Action::Command(program) => ctx.spawn_daemon(program.program(), program.args()),
+            // Executed directly when key event handling reports are inactive.
+            Action::Deferred(action) => action.execute(ctx),
             Action::Hint(hint) => {
                 ctx.display().hint_state.start(hint.clone());
                 ctx.mark_dirty();

@@ -58,7 +58,10 @@ use crate::display::color::Rgb;
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
-use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
+use crate::config::Action;
+use crate::input::{
+    self, ActionContext as _, DeferredKeys, Execute, FONT_SIZE_STEP, KEY_HANDLING_TIMEOUT,
+};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
 #[cfg(unix)]
@@ -794,13 +797,15 @@ impl ApplicationHandler<Event> for Processor {
             },
             (payload, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    // Keep the source tab id so per-tab events stay attributable.
+                    let event = Event::new(payload, *window_id).with_tab_id(event.tab_id);
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
                         event_loop,
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
-                        WinitEvent::UserEvent(Event::new(payload, *window_id)),
+                        WinitEvent::UserEvent(event),
                     );
                 }
             },
@@ -908,6 +913,8 @@ pub enum EventType {
     IpcGetConfig(Arc<UnixStream>),
     BlinkCursor,
     BlinkCursorTimeout,
+    /// A deferred key binding's application reply window elapsed.
+    DeferredKeyTimeout,
     SearchNext,
     #[cfg(unix)]
     Shutdown,
@@ -1072,6 +1079,12 @@ pub struct ActionContext<'a, N, T> {
     pub shell_pid: u32,
     /// Number of tabs (for tab bar click detection).
     pub tab_count: usize,
+
+    /// Key bindings deferred until the application reports the key event as unhandled.
+    pub deferred_keys: &'a mut DeferredKeys,
+
+    /// Identifier of the active tab, if any.
+    pub active_tab_id: Option<usize>,
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -1339,6 +1352,20 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     fn tab_count(&self) -> usize {
         self.tab_count
+    }
+
+    fn defer_key_actions(&mut self, actions: Vec<Action>) -> u16 {
+        let id = self.deferred_keys.push(actions, self.active_tab_id);
+
+        // One timer per window covers the queue; expiry processing reschedules for the rest.
+        let window_id = self.display.window.id();
+        let timer_id = TimerId::new(Topic::DeferredKey, window_id);
+        if !self.scheduler.scheduled(timer_id) {
+            let event = Event::new(EventType::DeferredKeyTimeout, window_id);
+            self.scheduler.schedule(event, KEY_HANDLING_TIMEOUT, false, timer_id);
+        }
+
+        id
     }
 
     fn transfer_tab(&mut self, tab_index: usize, cursor_x: i32, cursor_y: i32) {
@@ -2306,7 +2333,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     /// Handle events from winit.
     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
         match event {
-            WinitEvent::UserEvent(Event { payload, .. }) => match payload {
+            WinitEvent::UserEvent(Event { payload, tab_id, .. }) => match payload {
                 EventType::SearchNext => self.ctx.goto_match(None),
                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
                 EventType::BlinkCursor => {
@@ -2324,6 +2351,28 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     *self.ctx.cursor_blink_timed_out = true;
                     self.ctx.display.cursor_hidden = false;
                     *self.ctx.dirty = true;
+                },
+                EventType::DeferredKeyTimeout => {
+                    let window_id = self.ctx.display.window.id();
+                    let timer_id = TimerId::new(Topic::DeferredKey, window_id);
+                    self.ctx.scheduler.unschedule(timer_id);
+
+                    // An application that stopped answering is treated as not handling the keys,
+                    // but actions are dropped when their tab is no longer active since they would
+                    // act on the wrong terminal.
+                    let now = Instant::now();
+                    while let Some(deferred) = self.ctx.deferred_keys.pop_expired(now) {
+                        if deferred.tab_id == self.ctx.active_tab_id {
+                            for action in deferred.actions {
+                                action.execute(&mut self.ctx);
+                            }
+                        }
+                    }
+
+                    if let Some(deadline) = self.ctx.deferred_keys.next_deadline() {
+                        let event = Event::new(EventType::DeferredKeyTimeout, window_id);
+                        self.ctx.scheduler.schedule(event, deadline - now, false, timer_id);
+                    }
                 },
                 // Add message only if it's not already queued.
                 EventType::Message(message) if !self.ctx.message_buffer.is_queued(&message) => {
@@ -2386,6 +2435,24 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.ctx.write_to_pty(text.into_bytes());
                     },
                     TerminalEvent::PtyWrite(text) => self.ctx.write_to_pty(text.into_bytes()),
+                    TerminalEvent::KeyEventHandled(id, handled) => {
+                        // The initial tab's event proxy carries no tab id, but it is tab 0 once
+                        // a tab group exists; only the reported tab's own keys may be resolved.
+                        let source_tab_id = tab_id.or(self.ctx.active_tab_id.map(|_| 0));
+                        if let Some(deferred) = self.ctx.deferred_keys.take(id, source_tab_id)
+                            && deferred.tab_id == self.ctx.active_tab_id
+                        {
+                            if handled {
+                                // The application consumed the forwarded key as terminal input,
+                                // which bypassed `key_input`'s normal input handling.
+                                self.ctx.on_terminal_input_start();
+                            } else {
+                                for action in deferred.actions {
+                                    action.execute(&mut self.ctx);
+                                }
+                            }
+                        }
+                    },
                     TerminalEvent::MouseCursorDirty => self.reset_mouse_cursor(),
                     TerminalEvent::CursorBlinkingChange => self.ctx.update_cursor_blinking(),
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),

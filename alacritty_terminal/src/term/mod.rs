@@ -50,6 +50,13 @@ const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
 
+/// Private mode toggling key event handling reports (Unbroken extension).
+///
+/// While set, key events matching a deferred terminal keybinding are forwarded to the
+/// application with a trailing report id parameter, and the application answers with
+/// `CSI ? id ; handled u` so the terminal can run its own keybinding only for unhandled keys.
+pub const PRIVATE_MODE_REPORT_KEY_EVENT_HANDLING: u16 = 2064;
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct TermMode: u32 {
@@ -77,6 +84,7 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        const REPORT_KEY_EVENT_HANDLING = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -1296,6 +1304,12 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn report_key_event_handled(&mut self, id: u16, handled: bool) {
+        trace!("Application reported key event {id} as handled: {handled}");
+        self.event_proxy.send_event(Event::KeyEventHandled(id, handled));
+    }
+
+    #[inline]
     fn push_keyboard_mode(&mut self, mode: KeyboardModes) {
         if !self.config.kitty_keyboard {
             return;
@@ -1945,6 +1959,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(PRIVATE_MODE_REPORT_KEY_EVENT_HANDLING) => {
+                self.mode.insert(TermMode::REPORT_KEY_EVENT_HANDLING);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2008,6 +2026,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(PRIVATE_MODE_REPORT_KEY_EVENT_HANDLING) => {
+                self.mode.remove(TermMode::REPORT_KEY_EVENT_HANDLING);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2094,6 +2116,9 @@ impl<T: EventListener> Handler for Term<T> {
                 },
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
+            },
+            PrivateMode::Unknown(PRIVATE_MODE_REPORT_KEY_EVENT_HANDLING) => {
+                self.mode.contains(TermMode::REPORT_KEY_EVENT_HANDLING).into()
             },
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
@@ -2528,6 +2553,20 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    #[test]
+    fn report_key_event_handling_private_mode() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        let mode = PrivateMode::Unknown(PRIVATE_MODE_REPORT_KEY_EVENT_HANDLING);
+
+        term.set_private_mode(mode);
+        assert!(term.mode().contains(TermMode::REPORT_KEY_EVENT_HANDLING));
+
+        term.unset_private_mode(mode);
+        assert!(!term.mode().contains(TermMode::REPORT_KEY_EVENT_HANDLING));
+    }
 
     #[test]
     fn scroll_display_page_up() {
