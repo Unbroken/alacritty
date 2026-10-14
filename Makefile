@@ -15,6 +15,7 @@ COMPLETIONS = $(COMPLETIONS_DIR)/_alacritty \
 
 APP_NAME = Alacritty.app
 APP_TEMPLATE = $(ASSETS_DIR)/osx/$(APP_NAME)
+APP_ENTITLEMENTS = $(ASSETS_DIR)/osx/Alacritty.entitlements
 APP_DIR = $(RELEASE_DIR)/osx
 APP_BINARY = $(RELEASE_DIR)/$(TARGET)
 APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
@@ -85,7 +86,7 @@ $(APP_NAME)-%: $(TARGET)-%
 	@rm -rf $(APP_ASSETCATALOG_DIR)
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@codesign --remove-signature "$(APP_DIR)/$(APP_NAME)"
-	@codesign --force --deep $(APP_CODESIGN_FLAGS) --sign "$(APP_CODESIGN_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
+	@codesign --force --deep $(APP_CODESIGN_FLAGS) --entitlements "$(APP_ENTITLEMENTS)" --sign "$(APP_CODESIGN_IDENTITY)" "$(APP_DIR)/$(APP_NAME)"
 	@set -e; if [ -n "$(APP_NOTARIZE_PROFILE)" ]; then \
 		ditto -c -k --sequesterRsrc --keepParent "$(APP_DIR)/$(APP_NAME)" "$(APP_NOTARIZE_ARCHIVE)"; \
 		xcrun notarytool submit "$(APP_NOTARIZE_ARCHIVE)" --keychain-profile "$(APP_NOTARIZE_PROFILE)" --wait; \
