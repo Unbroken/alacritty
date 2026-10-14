@@ -314,7 +314,7 @@ mod platform {
 
 /// Manages desktop notifications for bell events across all platforms.
 pub struct DesktopNotifier {
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     proxy: EventLoopProxy<Event>,
     /// Active notifications per (window_id, tab_id) for deduplication.
     active: HashMap<(WindowId, Option<usize>), ActiveNotification>,
@@ -353,6 +353,8 @@ impl DesktopNotifier {
             self.remove_platform_notification(&existing.platform_id, window_id, tab_id);
         }
 
+        // Windows has no platform notification handle, so the id is `()`.
+        #[cfg_attr(windows, allow(clippy::let_unit_value))]
         let platform_id = self.send_platform_notification(window_id, tab_id, title, body);
 
         self.active.insert(key, ActiveNotification {
@@ -388,10 +390,11 @@ impl DesktopNotifier {
     /// Windows only: check if there's a pending notification click target.
     #[cfg(windows)]
     pub fn check_pending_click(&mut self, window_id: WindowId) -> Option<usize> {
-        if let Some((instant, wid, tab_id)) = self.pending_click.take() {
-            if wid == window_id && instant.elapsed() < std::time::Duration::from_secs(2) {
-                return tab_id;
-            }
+        if let Some((instant, wid, tab_id)) = self.pending_click.take()
+            && wid == window_id
+            && instant.elapsed() < std::time::Duration::from_secs(2)
+        {
+            return tab_id;
         }
         None
     }
